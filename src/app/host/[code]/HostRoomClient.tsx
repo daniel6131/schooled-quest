@@ -32,6 +32,7 @@ export default function HostRoomClient({ code }: { code: string }) {
   const hostKey = useLocalStorageItem(LS_HOST_KEY);
 
   const [room, setRoom] = useState<PublicRoomState | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const [hostState, setHostState] = useState<HostRoomState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
@@ -73,6 +74,11 @@ export default function HostRoomClient({ code }: { code: string }) {
   }, []);
 
   useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(t);
+  }, []);
+
+  useEffect(() => {
     fetch('/api/lan')
       .then((r) => r.json())
       .then((d: { url: string | null }) => setLanUrl(d.url))
@@ -98,6 +104,15 @@ export default function HostRoomClient({ code }: { code: string }) {
   const q = room?.currentQuestion;
   const boss = room?.boss;
   const shopOpen = room?.shop?.open ?? false;
+
+  const activePlayers = (room?.players ?? []).filter((p) => p.connected && !p.eliminated);
+  const lockedInCount = activePlayers.filter((p) => p.lockedIn).length;
+  const activeCount = activePlayers.length;
+  const allLockedIn = activeCount > 0 && lockedInCount === activeCount;
+
+  const revealAt = q?.revealAt ?? q?.endsAt ?? 0;
+  const canReveal =
+    !!q && (phase === 'question' || phase === 'boss') && !q.locked && now >= revealAt;
 
   if (!roomCode) {
     return (
@@ -166,7 +181,7 @@ export default function HostRoomClient({ code }: { code: string }) {
 
             <button
               className="rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-amber-600 disabled:opacity-40"
-              disabled={phase !== 'question' && phase !== 'boss'}
+              disabled={!canReveal}
               onClick={() => emitHost('question:reveal', {}, 'Reveal Answer')}
               type="button"
             >
@@ -201,6 +216,22 @@ export default function HostRoomClient({ code }: { code: string }) {
             <h2 className="text-lg font-semibold">
               {phase === 'boss' ? '🐉 Boss Question' : '❓ Current Question'}
             </h2>
+            {/* Timer */}
+            <div className="mt-3 flex items-center justify-between rounded-xl border bg-white px-3 py-2 text-sm">
+              <span className="font-semibold">⏱️ Reveal in</span>
+              <span className="font-bold tabular-nums">
+                {q.locked ? '—' : `${Math.max(0, Math.ceil((revealAt - now) / 1000))}s`}
+              </span>
+            </div>
+
+            <p className="mt-2 text-xs font-semibold text-neutral-700">
+              🔒 Locked in:{' '}
+              <span className="tabular-nums">
+                {lockedInCount}/{activeCount}
+              </span>
+              {allLockedIn ? ' · All locked!' : ''}
+            </p>
+
             <p className="mt-2 text-sm font-medium">{q.question.prompt}</p>
             <div className="mt-2 grid grid-cols-2 gap-2">
               {q.question.choices.map((c, i) => (

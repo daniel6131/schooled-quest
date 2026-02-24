@@ -1,7 +1,7 @@
 'use client';
 
 import { getSocket } from '@/lib/socket';
-import type { Ack, PublicRoomState, ShopItemId } from '@/lib/types';
+import type { Ack, PlayerRevealPayload, PublicRoomState, ShopItemId } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -33,12 +33,14 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const [log, setLog] = useState<string[]>([]);
   const [removedIndexes, setRemovedIndexes] = useState<number[] | null>(null);
   const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
-  const [answerLocked, setAnswerLocked] = useState(false);
   const [freezeBonusMs, setFreezeBonusMs] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [revealFeedback, setRevealFeedback] = useState<PlayerRevealPayload | null>(null);
 
   const [playerId, setPlayerId] = useState<string | null>(null);
   const localStorageChecked = useRef(false);
   const joinAttemptedRef = useRef(false);
+  const currentQuestionIdRef = useRef<string | null>(null);
 
   const addLog = useCallback((msg: string) => {
     setLog((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 30));
@@ -65,20 +67,34 @@ export default function PlayRoomClient({ code }: { code: string }) {
   useEffect(() => {
     const s = getSocket();
     const onRoomState = (nextRoom: PublicRoomState) => {
+      currentQuestionIdRef.current = nextRoom.currentQuestion?.question.id ?? null;
       setRoom((prev) => {
         if (nextRoom.currentQuestion?.question.id !== prev?.currentQuestion?.question.id) {
           setSelectedAnswer(null);
-          setAnswerLocked(false);
           setRemovedIndexes(null);
           setFreezeBonusMs(0);
+          setRevealFeedback(null);
         }
         return nextRoom;
       });
     };
+    const onPlayerReveal = (payload: PlayerRevealPayload) => {
+      const currentId = currentQuestionIdRef.current;
+      if (currentId && payload.questionId !== currentId) return;
+      setRevealFeedback(payload);
+    };
+
     s.on('room:state', onRoomState);
+    s.on('player:reveal', onPlayerReveal);
     return () => {
       s.off('room:state', onRoomState);
+      s.off('player:reveal', onPlayerReveal);
     };
+  }, []);
+
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(t);
   }, []);
 
   useEffect(() => {
@@ -138,22 +154,42 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const submitAnswer = useCallback(
     (answerIndex: number) => {
       if (!playerId) return;
+
+      // Allow changing answers: we always send the latest selection until time runs out / reveal locks.
+      const prev = selectedAnswer;
       setSelectedAnswer(answerIndex);
-      setAnswerLocked(true);
+
       emit<{ accepted: boolean }>(
         'player:answer',
         { code: roomCode, playerId, answerIndex },
         (ack) => {
           if (!ack.ok) {
             setError(ack.error);
-            setAnswerLocked(false);
+            // Revert optimistic UI if the server rejected (time up / locked / etc.)
+            setSelectedAnswer(prev ?? null);
             addLog(`❌ ${ack.error}`);
-          } else addLog(`✅ Answered: ${String.fromCharCode(65 + answerIndex)}`);
+          } else {
+            addLog(`✅ Selected: ${String.fromCharCode(65 + answerIndex)}`);
+          }
         }
       );
     },
-    [emit, playerId, roomCode, addLog]
+    [emit, playerId, roomCode, addLog, selectedAnswer]
   );
+
+  const lockIn = useCallback(() => {
+    if (!playerId) return;
+    emit<{ room: PublicRoomState }>('player:lockin', { code: roomCode, playerId }, (ack) => {
+      if (!ack.ok) {
+        setError(ack.error);
+        addLog(`❌ Lock in: ${ack.error}`);
+      } else {
+        setError(null);
+        setRoom(ack.data.room);
+        addLog('🔒 Locked in!');
+      }
+    });
+  }, [emit, playerId, roomCode, addLog]);
 
   const buyItem = useCallback(
     (itemId: ShopItemId) => {
@@ -182,13 +218,18 @@ export default function PlayRoomClient({ code }: { code: string }) {
         } else {
           setError(null);
           setRoom(ack.data.room);
-          if (ack.data.removedIndexes) setRemovedIndexes(ack.data.removedIndexes);
+          if (ack.data.removedIndexes) {
+            setRemovedIndexes(ack.data.removedIndexes);
+            if (selectedAnswer !== null && ack.data.removedIndexes.includes(selectedAnswer)) {
+              setSelectedAnswer(null);
+            }
+          }
           if (ack.data.bonusMs) setFreezeBonusMs((prev) => prev + (ack.data.bonusMs ?? 0));
           addLog(`✅ Used ${ITEM_META[itemId].name}`);
         }
       });
     },
-    [emit, playerId, roomCode, addLog]
+    [emit, playerId, roomCode, addLog, selectedAnswer]
   );
 
   const doBuyback = useCallback(() => {
@@ -212,6 +253,19 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const me = room?.players.find((p) => p.playerId === playerId);
   const shopOpen = room?.shop?.open ?? false;
   const isQuestionPhase = phase === 'question' || phase === 'boss';
+  const revealAt = q ? (q.revealAt ?? q.endsAt) : 0;
+  const personalEndsAt = q ? q.endsAt + freezeBonusMs : 0;
+  const playerEndsAt = q ? Math.min(revealAt, personalEndsAt) : 0;
+  const msLeft = q ? Math.max(0, playerEndsAt - now) : 0;
+  const secondsLeft = q ? Math.ceil(msLeft / 1000) : 0;
+  const totalMs = q ? Math.max(1, playerEndsAt - q.startedAt) : 1;
+  const remainingFrac = q ? Math.max(0, Math.min(1, msLeft / totalMs)) : 0;
+  const timeUp = q ? now >= playerEndsAt : false;
+  const revealedCorrectIndex = q?.revealedAnswerIndex;
+
+  const activePlayers = (room?.players ?? []).filter((p) => p.connected && !p.eliminated);
+  const lockedInCount = activePlayers.filter((p) => p.lockedIn).length;
+  const activeCount = activePlayers.length;
 
   // Separate inventory into active vs passive for display
   const activeItems = Object.entries(me?.inventory ?? {}).filter(
@@ -337,46 +391,125 @@ export default function PlayRoomClient({ code }: { code: string }) {
               </p>
             )}
 
+            {/* Timer */}
+            <div className="mt-3 rounded-xl border bg-white p-3">
+              <div className="flex items-center justify-between text-sm">
+                <span className="font-semibold">{timeUp ? '⏱️ Time’s up' : '⏱️ Time left'}</span>
+                <span className="font-bold tabular-nums">{secondsLeft}s</span>
+              </div>
+              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-neutral-200">
+                <div
+                  className="h-2 bg-blue-500 transition-[width]"
+                  style={{ width: `${Math.round(remainingFrac * 100)}%` }}
+                />
+              </div>
+            </div>
+
             <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
+            {/* Reveal feedback */}
+            {q.locked && revealFeedback && (
+              <div
+                className={`mt-3 rounded-xl border p-3 text-sm font-semibold ${
+                  revealFeedback.correct
+                    ? 'border-green-300 bg-green-50 text-green-800'
+                    : revealFeedback.yourAnswerIndex === null
+                      ? 'border-amber-300 bg-amber-50 text-amber-800'
+                      : 'border-red-300 bg-red-50 text-red-800'
+                }`}
+              >
+                {revealFeedback.correct
+                  ? `✅ Correct! +${revealFeedback.scoreDelta} pts`
+                  : revealFeedback.yourAnswerIndex === null
+                    ? '⏱️ No answer submitted'
+                    : '❌ Wrong'}
+                <span className="ml-2 font-medium text-neutral-700">
+                  {revealFeedback.shieldUsed ? '🛡️ Shield used' : ''}
+                  {revealFeedback.doublePointsUsed ? '⭐ Double Points used' : ''}
+                  {revealFeedback.buybackUsed ? '🪙 Buyback used' : ''}
+                  {revealFeedback.livesDelta !== 0 ? ` · ${revealFeedback.livesDelta} lives` : ''}
+                  {revealFeedback.coinsDelta !== 0 ? ` · ${revealFeedback.coinsDelta} coins` : ''}
+                </span>
+              </div>
+            )}
 
             <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
               {q.question.choices.map((choice, i) => {
                 const isRemoved = removedIndexes?.includes(i);
                 const isSelected = selectedAnswer === i;
+                const showReveal = q.locked && typeof revealedCorrectIndex === 'number';
+                const isCorrect = showReveal && i === revealedCorrectIndex;
+                const yourIdx = revealFeedback?.yourAnswerIndex ?? selectedAnswer;
+                const isYourPick = yourIdx === i;
+                const isWrongPick = showReveal && isYourPick && !isCorrect;
                 return (
                   <button
                     key={i}
                     type="button"
-                    disabled={answerLocked || q.locked || !!me?.eliminated || !!isRemoved}
+                    disabled={
+                      q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn || !!isRemoved
+                    }
                     onClick={() => submitAnswer(i)}
                     className={`rounded-xl border-2 px-4 py-3 text-left text-sm font-medium transition-all ${
                       isRemoved
                         ? 'border-neutral-200 bg-neutral-100 text-neutral-400 line-through'
-                        : isSelected
-                          ? 'border-blue-500 bg-blue-50 text-blue-800'
-                          : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
+                        : isCorrect
+                          ? 'border-green-500 bg-green-50 text-green-800'
+                          : isWrongPick
+                            ? 'border-red-500 bg-red-50 text-red-800'
+                            : isSelected
+                              ? 'border-blue-500 bg-blue-50 text-blue-800'
+                              : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
                     } disabled:cursor-not-allowed`}
                   >
                     <span className="mr-2 font-bold text-neutral-400">
                       {String.fromCharCode(65 + i)}
                     </span>
                     {choice}
-                    {isSelected && ' ✓'}
+                    {showReveal
+                      ? isCorrect
+                        ? ' ✅'
+                        : isWrongPick
+                          ? ' ❌'
+                          : ''
+                      : isSelected
+                        ? ' ✓'
+                        : ''}
                   </button>
                 );
               })}
             </div>
 
+            {/* Lock In */}
+            {isQuestionPhase && !q.locked && !me?.eliminated && activeCount > 0 && (
+              <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-white p-3">
+                <div className="text-xs font-semibold text-neutral-700">
+                  🔒 Locked in:{' '}
+                  <span className="tabular-nums">
+                    {lockedInCount}/{activeCount}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={lockIn}
+                  disabled={timeUp || !!me?.lockedIn || selectedAnswer === null}
+                  className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {me?.lockedIn ? '✅ Locked In' : '🔒 Lock In'}
+                </button>
+              </div>
+            )}
+
             {/* Active items — usable during question */}
-            {isQuestionPhase && !answerLocked && activeItems.length > 0 && (
+            {isQuestionPhase && activeItems.length > 0 && (
               <div className="mt-3 flex flex-wrap gap-2 border-t border-amber-200 pt-3">
                 <span className="self-center text-xs text-neutral-500">Use:</span>
                 {activeItems.map(([itemId, count]) => (
                   <button
                     key={itemId}
                     type="button"
+                    disabled={q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn}
                     onClick={() => handleUseItem(itemId)}
-                    className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50"
+                    className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ITEM_META[itemId].emoji} {ITEM_META[itemId].name}
                     {count > 1 && ` ×${count}`}
@@ -384,12 +517,17 @@ export default function PlayRoomClient({ code }: { code: string }) {
                 ))}
               </div>
             )}
-
-            {answerLocked && (
-              <p className="mt-2 text-xs font-medium text-blue-600">
-                Answer locked! Waiting for reveal…
-              </p>
-            )}
+            <p className="mt-2 text-xs font-medium text-blue-700">
+              {q.locked
+                ? 'Answer revealed.'
+                : timeUp
+                  ? '⏱️ Time’s up — waiting for the host to reveal…'
+                  : me?.lockedIn
+                    ? '🔒 Locked in — waiting for the host to reveal…'
+                    : selectedAnswer === null
+                      ? 'Tap an answer to submit. You can change it until you lock in or time runs out.'
+                      : `Selected ${String.fromCharCode(65 + selectedAnswer)} — tap another option to change before you lock in or time runs out.`}
+            </p>
           </section>
         )}
 

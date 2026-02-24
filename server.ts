@@ -23,6 +23,9 @@ type Player = {
   coins: number;
   eliminated: boolean;
 
+  /** Whether this player has locked in their answer for the current question */
+  lockedIn: boolean;
+
   inventory: Record<string, number>;
 
   /** Passive buffs that are "armed" and waiting to trigger */
@@ -61,6 +64,8 @@ type CurrentQuestion = {
   /** Per-player bonus time from freeze_time (ms) */
   freezeBonus: Map<string, number>;
   locked: boolean;
+  /** If set, the question ended early (e.g. everyone locked in) and host can reveal at this time */
+  forcedRevealAt?: number;
 };
 
 type BossState = {
@@ -93,7 +98,10 @@ type PublicRoomState = {
     question: PublicQuestion;
     startedAt: number;
     endsAt: number;
+    /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
+    revealAt: number;
     locked: boolean;
+    revealedAnswerIndex?: number;
   };
   shop?: { open: boolean; items: ShopItem[] };
   boss?: BossState;
@@ -107,6 +115,20 @@ type HostRoomState = {
   currentAnswerIndex?: number;
   correctChoice?: string;
   questionDebug?: Question;
+};
+
+type PlayerRevealPayload = {
+  questionId: string;
+  correctAnswerIndex: number;
+  yourAnswerIndex: number | null;
+  correct: boolean;
+  scoreDelta: number;
+  coinsDelta: number;
+  livesDelta: number;
+  eliminated: boolean;
+  shieldUsed?: boolean;
+  doublePointsUsed?: boolean;
+  buybackUsed?: boolean;
 };
 
 type ItemUseAckData =
@@ -281,6 +303,8 @@ function toPublicPlayer(p: Player): PublicPlayer {
     coins: p.coins,
     eliminated: p.eliminated,
 
+    lockedIn: p.lockedIn,
+
     inventory: inv,
 
     buffs: {
@@ -293,6 +317,42 @@ function toPublicPlayer(p: Player): PublicPlayer {
 function getCurrentQuestion(room: Room): Question | undefined {
   if (!room.currentQuestion) return undefined;
   return room.questionDeck.find((q) => q.id === room.currentQuestion?.questionId);
+}
+
+function activePlayersForQuestion(room: Room): Player[] {
+  return Array.from(room.playersById.values()).filter((p) => p.connected && !p.eliminated);
+}
+
+function computeRevealAt(room: Room): number {
+  if (!room.currentQuestion) return 0;
+  const baseEndsAt = room.currentQuestion.endsAt;
+  if (room.currentQuestion.forcedRevealAt) return room.currentQuestion.forcedRevealAt;
+
+  let maxEndsAt = baseEndsAt;
+  const active = activePlayersForQuestion(room);
+  for (const p of active) {
+    const bonus = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
+    maxEndsAt = Math.max(maxEndsAt, baseEndsAt + bonus);
+  }
+  return maxEndsAt;
+}
+
+function allActivePlayersLockedIn(room: Room): boolean {
+  const active = activePlayersForQuestion(room);
+  if (active.length === 0) return false;
+  return active.every((p) => p.lockedIn);
+}
+
+function maybeForceCloseIfAllLocked(room: Room) {
+  if (!room.currentQuestion) return;
+  if (room.currentQuestion.locked) return;
+  if (room.phase !== 'question' && room.phase !== 'boss') return;
+  if (room.currentQuestion.forcedRevealAt) return;
+
+  if (allActivePlayersLockedIn(room)) {
+    room.currentQuestion.forcedRevealAt = Date.now();
+    logger.info(`  🔒 All active players locked in — question ended early in room ${room.code}`);
+  }
 }
 
 function toPublicQuestion(q: Question): PublicQuestion {
@@ -325,6 +385,8 @@ function roomToPublic(room: Room): PublicRoomState {
             startedAt: room.currentQuestion.startedAt,
             endsAt: room.currentQuestion.endsAt,
             locked: room.currentQuestion.locked,
+            revealAt: computeRevealAt(room),
+            revealedAnswerIndex: room.currentQuestion.locked ? q.answerIndex : undefined,
           }
         : undefined,
     shop: {
@@ -380,6 +442,10 @@ function nextQuestion(room: Room): Question | null {
 
 function startQuestion(room: Room, q: Question) {
   const now = Date.now();
+  // Reset per-question flags
+  for (const p of room.playersById.values()) {
+    p.lockedIn = false;
+  }
   room.phase = room.boss ? 'boss' : 'question';
   room.currentQuestion = {
     questionId: q.id,
@@ -388,6 +454,7 @@ function startQuestion(room: Room, q: Question) {
     answersByPlayerId: new Map(),
     freezeBonus: new Map(),
     locked: false,
+    forcedRevealAt: undefined,
   };
 }
 
@@ -410,66 +477,96 @@ function armPassiveBuff(p: Player, itemId: ShopItemId) {
  * 3. If wrong: lose a heart (unless shield buff active, consume it)
  * 4. If eliminated: check for buyback_token in inventory, auto-revive
  */
-function revealAndScore(room: Room) {
+function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
   const q = getCurrentQuestion(room);
-  if (!q || !room.currentQuestion) return;
+  if (!q || !room.currentQuestion) return new Map();
 
   room.currentQuestion.locked = true;
   room.phase = 'reveal';
 
+  const results = new Map<string, PlayerRevealPayload>();
+
   for (const p of room.playersById.values()) {
-    if (p.eliminated) continue;
+    const beforeScore = p.score;
+    const beforeCoins = p.coins;
+    const beforeLives = p.lives;
+    const wasEliminated = p.eliminated;
 
     const ans = room.currentQuestion.answersByPlayerId.get(p.playerId);
     const answered = typeof ans === 'number';
     const correct = answered && ans === q.answerIndex;
 
-    if (correct) {
-      // ── Double Points (passive auto-trigger) ──
-      let multiplier = 1;
-      if (p.buffs.doublePoints) {
-        multiplier = 2;
-        p.buffs.doublePoints = false;
-        const count = p.inventory['double_points'] || 0;
-        if (count > 0) p.inventory['double_points'] = count - 1;
-        logger.info(`  🌟 ${p.name}: double points consumed`);
-      }
+    let shieldUsed = false;
+    let doublePointsUsed = false;
+    let buybackUsed = false;
 
-      const delta = q.value * multiplier;
-      p.score += delta;
-      p.coins += Math.floor(q.value / 2);
+    if (!wasEliminated) {
+      if (correct) {
+        // ── Double Points (passive auto-trigger) ──
+        let multiplier = 1;
+        if (p.buffs.doublePoints) {
+          multiplier = 2;
+          doublePointsUsed = true;
+          p.buffs.doublePoints = false;
+          const count = p.inventory['double_points'] || 0;
+          if (count > 0) p.inventory['double_points'] = count - 1;
+          logger.info(`  🌟 ${p.name}: double points consumed`);
+        }
 
-      if (room.boss) {
-        room.boss.hp = Math.max(0, room.boss.hp - 1);
-      }
-    } else {
-      // ── Shield (passive auto-trigger) ──
-      if (p.buffs.shield) {
-        p.buffs.shield = false;
-        const count = p.inventory['shield'] || 0;
-        if (count > 0) p.inventory['shield'] = count - 1;
-        logger.info(`  🛡️ ${p.name}: shield absorbed the hit`);
-        // No heart loss!
+        const delta = q.value * multiplier;
+        p.score += delta;
+        p.coins += Math.floor(q.value / 2);
+
+        if (room.boss) {
+          room.boss.hp = Math.max(0, room.boss.hp - 1);
+        }
       } else {
-        p.lives -= 1;
-        if (p.lives <= 0) {
-          p.lives = 0;
+        // ── Shield (passive auto-trigger) ──
+        if (p.buffs.shield) {
+          shieldUsed = true;
+          p.buffs.shield = false;
+          const count = p.inventory['shield'] || 0;
+          if (count > 0) p.inventory['shield'] = count - 1;
+          logger.info(`  🛡️ ${p.name}: shield absorbed the hit`);
+          // No heart loss
+        } else {
+          p.lives -= 1;
+          if (p.lives <= 0) {
+            p.lives = 0;
 
-          // ── Buyback Token (passive auto-trigger on elimination) ──
-          const tokenCount = p.inventory['buyback_token'] || 0;
-          if (tokenCount > 0) {
-            p.inventory['buyback_token'] = tokenCount - 1;
-            p.lives = 1;
-            p.eliminated = false;
-            logger.info(`  🪙 ${p.name}: buyback token auto-revived`);
-          } else {
-            p.eliminated = true;
-            logger.info(`  💀 ${p.name}: eliminated`);
+            // ── Buyback Token (passive auto-trigger on elimination) ──
+            const tokenCount = p.inventory['buyback_token'] || 0;
+            if (tokenCount > 0) {
+              buybackUsed = true;
+              p.inventory['buyback_token'] = tokenCount - 1;
+              p.lives = 1;
+              p.eliminated = false;
+              logger.info(`  🪙 ${p.name}: buyback token auto-revived`);
+            } else {
+              p.eliminated = true;
+              logger.info(`  💀 ${p.name}: eliminated`);
+            }
           }
         }
       }
     }
+
+    results.set(p.playerId, {
+      questionId: q.id,
+      correctAnswerIndex: q.answerIndex,
+      yourAnswerIndex: answered ? (ans as number) : null,
+      correct: !!correct,
+      scoreDelta: p.score - beforeScore,
+      coinsDelta: p.coins - beforeCoins,
+      livesDelta: p.lives - beforeLives,
+      eliminated: p.eliminated,
+      shieldUsed: shieldUsed || undefined,
+      doublePointsUsed: doublePointsUsed || undefined,
+      buybackUsed: buybackUsed || undefined,
+    });
   }
+
+  return results;
 }
 
 function openShop(room: Room, open: boolean) {
@@ -577,6 +674,7 @@ async function main() {
             coins: room.config.startingCoins,
             eliminated: false,
             inventory: {},
+            lockedIn: false,
             buffs: { doublePoints: false, shield: false },
           };
 
@@ -724,8 +822,23 @@ async function main() {
           const room = requireRoom(code);
           requireHost(room, (payload?.hostKey || '').trim());
 
-          revealAndScore(room);
+          if (!room.currentQuestion) throw new Error('No active question.');
+          if (room.phase !== 'question' && room.phase !== 'boss') {
+            throw new Error('Not in a revealable phase.');
+          }
+          if (room.currentQuestion.locked) throw new Error('Already revealed.');
+
+          const revealAt = computeRevealAt(room);
+          if (Date.now() < revealAt) throw new Error('Players are still answering.');
+          const results = revealAndScore(room);
           maybeEnd(room);
+
+          // Private per-player feedback on reveal
+          for (const p of room.playersById.values()) {
+            const payload = results.get(p.playerId);
+            if (!payload) continue;
+            io.to(p.socketId).emit('player:reveal', payload);
+          }
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -874,6 +987,17 @@ async function main() {
           const q = getCurrentQuestion(room);
           if (!q || !room.currentQuestion) throw new Error('No active question.');
 
+          if (room.currentQuestion.locked) throw new Error('Question is locked.');
+          if (p.eliminated) throw new Error('You are eliminated.');
+          if (p.lockedIn) throw new Error('Answer locked in.');
+          if (p.lockedIn) throw new Error('You have locked in your answer.');
+
+          const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
+          const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
+          const revealAt = computeRevealAt(room);
+          const effectiveEndsAt = Math.min(playerEndsAt, revealAt);
+          if (Date.now() > effectiveEndsAt) throw new Error('Time is up.');
+
           if (itemId === 'fifty_fifty') {
             p.inventory[itemId] = count - 1;
             const wrong = q.choices.map((_, idx) => idx).filter((idx) => idx !== q.answerIndex);
@@ -918,11 +1042,20 @@ async function main() {
           const answerIndex = Number(payload?.answerIndex);
 
           if (!room.currentQuestion) throw new Error('No active question.');
+          if (room.phase !== 'question' && room.phase !== 'boss') {
+            throw new Error('Not accepting answers right now.');
+          }
           if (room.currentQuestion.locked) throw new Error('Question is locked.');
           if (p.eliminated) throw new Error('You are eliminated.');
 
           const q = getCurrentQuestion(room);
           if (!q) throw new Error('Question not found.');
+          const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
+          const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
+          const revealAt = computeRevealAt(room);
+          const effectiveEndsAt = Math.min(playerEndsAt, revealAt);
+          if (Date.now() > effectiveEndsAt) throw new Error('Time is up.');
+
           if (!Number.isFinite(answerIndex) || answerIndex < 0 || answerIndex >= q.choices.length) {
             throw new Error('Invalid answer.');
           }
@@ -930,6 +1063,51 @@ async function main() {
           room.currentQuestion.answersByPlayerId.set(p.playerId, answerIndex);
 
           ack({ ok: true, data: { accepted: true } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Player: Lock In ── */
+    socket.on(
+      'player:lockin',
+      (
+        payload: { code: string; playerId: string },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          const p = requirePlayer(room, (payload?.playerId || '').trim());
+
+          if (!room.currentQuestion) throw new Error('No active question.');
+          if (room.phase !== 'question' && room.phase !== 'boss') {
+            throw new Error('Not accepting lock-ins right now.');
+          }
+          if (room.currentQuestion.locked) throw new Error('Question is locked.');
+          if (p.eliminated) throw new Error('You are eliminated.');
+
+          const q = getCurrentQuestion(room);
+          if (!q) throw new Error('Question not found.');
+
+          const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
+          const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
+          const revealAt = computeRevealAt(room);
+          const effectiveEndsAt = Math.min(playerEndsAt, revealAt);
+          if (Date.now() > effectiveEndsAt) throw new Error('Time is up.');
+
+          const ans = room.currentQuestion.answersByPlayerId.get(p.playerId);
+          if (typeof ans !== 'number') throw new Error('Pick an answer before locking in.');
+
+          p.lockedIn = true;
+          logger.info(`  🔒 ${p.name} locked in (${room.code})`);
+
+          // If everyone has locked in, end the timer early
+          maybeForceCloseIfAllLocked(room);
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
         } catch (e) {
           ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
@@ -1014,6 +1192,7 @@ async function main() {
         room.socketToPlayerId.delete(socket.id);
         const p = room.playersById.get(playerId);
         if (p) p.connected = false;
+        maybeForceCloseIfAllLocked(room);
         broadcastRoom(io, room);
         maybeEnd(room);
       }

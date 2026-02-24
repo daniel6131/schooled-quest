@@ -20,6 +20,9 @@ export type Player = {
   coins: number;
   eliminated: boolean;
 
+  /** Whether you have locked in your answer for the current question. */
+  lockedIn: boolean;
+
   inventory: Record<string, number>;
 
   /** Passive buffs currently active — shown as indicators on the player's HUD */
@@ -89,7 +92,11 @@ export type PublicRoomState = {
     question: PublicQuestion;
     startedAt: number;
     endsAt: number;
+    /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
+    revealAt: number;
     locked: boolean;
+    /** Present only after host reveals. */
+    revealedAnswerIndex?: number;
   };
   shop?: {
     open: boolean;
@@ -106,6 +113,20 @@ export type HostRoomState = {
   currentAnswerIndex?: number;
   correctChoice?: string;
   questionDebug?: JsonValue;
+};
+
+export type PlayerRevealPayload = {
+  questionId: string;
+  correctAnswerIndex: number;
+  yourAnswerIndex: number | null;
+  correct: boolean;
+  scoreDelta: number;
+  coinsDelta: number;
+  livesDelta: number;
+  eliminated: boolean;
+  shieldUsed?: boolean;
+  doublePointsUsed?: boolean;
+  buybackUsed?: boolean;
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };
