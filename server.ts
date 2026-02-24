@@ -8,7 +8,22 @@ import { Server } from 'socket.io';
 
 /* ────────────────────── Types ────────────────────── */
 
-type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'ended';
+type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'intermission' | 'ended';
+type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
+
+type ActConfig = {
+  id: ActId;
+  name: string;
+  emoji: string;
+  description: string;
+  questionDurationMs: number;
+  heartsAtRisk: boolean;
+  heartsOnlyOnHard: boolean;
+  coinRewardBase: number;
+  scoreMultiplier: number;
+  /** Which shop items are available for purchase during this act's shop windows */
+  availableShopItems: ShopItemId[];
+};
 
 type Player = {
   playerId: string;
@@ -23,12 +38,10 @@ type Player = {
   coins: number;
   eliminated: boolean;
 
-  /** Whether this player has locked in their answer for the current question */
   lockedIn: boolean;
 
   inventory: Record<string, number>;
 
-  /** Passive buffs that are "armed" and waiting to trigger */
   buffs: {
     doublePoints: boolean;
     shield: boolean;
@@ -44,6 +57,8 @@ type Question = {
   choices: string[];
   answerIndex: number;
   value: number;
+  /** Whether this is a "hard" question — matters in acts with heartsOnlyOnHard */
+  hard?: boolean;
 };
 
 type PublicQuestion = Omit<Question, 'answerIndex'>;
@@ -61,10 +76,8 @@ type CurrentQuestion = {
   startedAt: number;
   endsAt: number;
   answersByPlayerId: Map<string, number>;
-  /** Per-player bonus time from freeze_time (ms) */
   freezeBonus: Map<string, number>;
   locked: boolean;
-  /** If set, the question ended early (e.g. everyone locked in) and host can reveal at this time */
   forcedRevealAt?: number;
 };
 
@@ -88,6 +101,12 @@ type ShopItem = {
 
 type Ack<T> = { ok: true; data: T } | { ok: false; error: string };
 
+type ReviveRequest = {
+  playerId: string;
+  playerName: string;
+  requestedAt: number;
+};
+
 type PublicRoomState = {
   code: string;
   createdAt: number;
@@ -98,7 +117,6 @@ type PublicRoomState = {
     question: PublicQuestion;
     startedAt: number;
     endsAt: number;
-    /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
     revealAt: number;
     locked: boolean;
     revealedAnswerIndex?: number;
@@ -106,6 +124,15 @@ type PublicRoomState = {
   shop?: { open: boolean; items: ShopItem[] };
   boss?: BossState;
   remainingQuestions: number;
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    description: string;
+    heartsAtRisk: boolean;
+    questionNumber: number;
+    totalQuestions: number;
+  };
 };
 
 type HostRoomState = {
@@ -115,6 +142,17 @@ type HostRoomState = {
   currentAnswerIndex?: number;
   correctChoice?: string;
   questionDebug?: Question;
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    questionNumber: number;
+    totalQuestions: number;
+    heartsAtRisk: boolean;
+  };
+  availableActs?: ActId[];
+  /** If set, a player is requesting to be revived and host must approve/decline */
+  pendingRevive?: ReviveRequest;
 };
 
 type PlayerRevealPayload = {
@@ -129,6 +167,7 @@ type PlayerRevealPayload = {
   shieldUsed?: boolean;
   doublePointsUsed?: boolean;
   buybackUsed?: boolean;
+  heartsAtRisk?: boolean;
 };
 
 type ItemUseAckData =
@@ -145,25 +184,227 @@ const handle = nextApp.getRequestHandler();
 const makeCode = customAlphabet('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 5);
 
 const DEFAULT_CONFIG: RoomConfig = {
-  maxLives: 3,
-  questionDurationMs: 25_000,
+  maxLives: 1,
+  questionDurationMs: 25_000, // fallback, acts override this
   startingCoins: 150,
   buybackCostCoins: 200,
   bossHp: 6,
 };
 
+/* ────────────────────── Act Definitions ────────────────────── */
+
+const ACT_CONFIGS: Record<ActId, ActConfig> = {
+  homeroom: {
+    id: 'homeroom',
+    name: 'Homeroom',
+    emoji: '🏫',
+    description: 'Warm up! No hearts at risk. Build your score and earn starter gold.',
+    questionDurationMs: 22_000, // 20-25s range, we pick 22s
+    heartsAtRisk: false,
+    heartsOnlyOnHard: false,
+    coinRewardBase: 50, // generous starter coins
+    scoreMultiplier: 1.0,
+    // Act 1: only basic active items — let players learn the ropes
+    availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points'],
+  },
+  pop_quiz: {
+    id: 'pop_quiz',
+    name: 'Pop Quiz',
+    emoji: '📝',
+    description: 'Things heat up. Hard questions cost hearts!',
+    questionDurationMs: 27_000,
+    heartsAtRisk: false, // base is safe
+    heartsOnlyOnHard: true, // only hard questions cost hearts
+    coinRewardBase: 40,
+    scoreMultiplier: 1.0,
+    // Act 2: introduce Shield + Buyback now that hearts can be lost on hard Qs
+    availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+  },
+  field_trip: {
+    id: 'field_trip',
+    name: 'Field Trip',
+    emoji: '🎒',
+    description: 'Wrong answers cost hearts. Buyback becomes your best friend.',
+    questionDurationMs: 30_000,
+    heartsAtRisk: true,
+    heartsOnlyOnHard: false,
+    coinRewardBase: 35,
+    scoreMultiplier: 1.5,
+    // Act 3: everything available
+    availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+  },
+  boss_fight: {
+    id: 'boss_fight',
+    name: 'Boss Fight',
+    emoji: '🐉',
+    description: 'The final showdown. Escalating points, hearts on the line.',
+    questionDurationMs: 30_000,
+    heartsAtRisk: true,
+    heartsOnlyOnHard: false,
+    coinRewardBase: 30,
+    scoreMultiplier: 2.0,
+    // Act 4: everything available
+    availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+  },
+};
+
+const ACT_ORDER: ActId[] = ['homeroom', 'pop_quiz', 'field_trip', 'boss_fight'];
+
+/* ────────────────────── Question Bank (per act) ────────────────────── */
+
 /**
- * ITEM CATALOGUE
- *
- * Passive items: bought in shop → buff icon appears → auto-triggers at the right moment
- *   - double_points: auto-consumed on next correct answer (during reveal)
- *   - shield: auto-consumed when you'd lose a heart (during reveal)
- *   - buyback_token: auto-consumed when you're eliminated (during reveal)
- *
- * Active items: bought in shop → "Use" button during question phase
- *   - fifty_fifty: removes 2 wrong answers
- *   - freeze_time: adds +10s to your personal timer
+ * Sample questions organized by act. In production these would come from a DB or JSON file.
+ * For now we have a handful per act for testing.
  */
+function getActQuestions(actId: ActId): Question[] {
+  switch (actId) {
+    case 'homeroom':
+      return [
+        {
+          id: 'hr1',
+          category: 'General',
+          prompt: 'Which language is used to style web pages?',
+          choices: ['HTML', 'CSS', 'TypeScript', 'Node.js'],
+          answerIndex: 1,
+          value: 100,
+        },
+        {
+          id: 'hr2',
+          category: 'Gaming',
+          prompt: 'In Rocket League, what do you hit into the goal?',
+          choices: ['Puck', 'Ball', 'Disc', 'Cube'],
+          answerIndex: 1,
+          value: 100,
+        },
+        // {
+        //   id: 'hr3',
+        //   category: 'Internet',
+        //   prompt: "What does 'DM' commonly stand for?",
+        //   choices: ['Direct Message', 'Data Mode', 'Dynamic Module', 'Dual Monitor'],
+        //   answerIndex: 0,
+        //   value: 100,
+        // },
+        // {
+        //   id: 'hr4',
+        //   category: 'General',
+        //   prompt: 'Which of these is NOT a database?',
+        //   choices: ['PostgreSQL', 'MongoDB', 'Redis', 'TailwindCSS'],
+        //   answerIndex: 3,
+        //   value: 150,
+        // },
+        // {
+        //   id: 'hr5',
+        //   category: 'Gaming',
+        //   prompt: 'Which company makes the PlayStation?',
+        //   choices: ['Nintendo', 'Sony', 'Microsoft', 'Valve'],
+        //   answerIndex: 1,
+        //   value: 100,
+        // },
+      ];
+
+    case 'pop_quiz':
+      return [
+        {
+          id: 'pq1',
+          category: 'Science',
+          prompt: 'What is the chemical symbol for gold?',
+          choices: ['Go', 'Gd', 'Au', 'Ag'],
+          answerIndex: 2,
+          value: 150,
+          hard: true,
+        },
+        {
+          id: 'pq2',
+          category: 'Geography',
+          prompt: 'What is the capital of Australia?',
+          choices: ['Sydney', 'Melbourne', 'Canberra', 'Perth'],
+          answerIndex: 2,
+          value: 150,
+          hard: true,
+        },
+        // {
+        //   id: 'pq3',
+        //   category: 'Music',
+        //   prompt: "Which artist released the album 'Blonde'?",
+        //   choices: ['Tyler, The Creator', 'Kanye West', 'Frank Ocean', 'Childish Gambino'],
+        //   answerIndex: 2,
+        //   value: 200,
+        //   hard: true,
+        // },
+        // {
+        //   id: 'pq4',
+        //   category: 'History',
+        //   prompt: 'In which year did the Berlin Wall fall?',
+        //   choices: ['1987', '1989', '1991', '1993'],
+        //   answerIndex: 1,
+        //   value: 200,
+        //   hard: true,
+        // },
+      ];
+
+    case 'field_trip':
+      return [
+        {
+          id: 'ft1',
+          category: 'Science',
+          prompt: 'How many bones are in the adult human body?',
+          choices: ['186', '196', '206', '216'],
+          answerIndex: 2,
+          value: 200,
+        },
+        {
+          id: 'ft2',
+          category: 'Geography',
+          prompt: 'Which country has the most time zones?',
+          choices: ['Russia', 'USA', 'France', 'China'],
+          answerIndex: 2,
+          value: 250,
+        },
+        // {
+        //   id: 'ft3',
+        //   category: 'Movies',
+        //   prompt: "Who directed 'Inception'?",
+        //   choices: ['Steven Spielberg', 'Christopher Nolan', 'Denis Villeneuve', 'James Cameron'],
+        //   answerIndex: 1,
+        //   value: 200,
+        // },
+      ];
+
+    case 'boss_fight':
+      return [
+        {
+          id: 'bf1',
+          category: 'Boss',
+          prompt: 'What year was the first iPhone released?',
+          choices: ['2005', '2006', '2007', '2008'],
+          answerIndex: 2,
+          value: 300,
+        },
+        {
+          id: 'bf2',
+          category: 'Boss',
+          prompt: 'Which element has the atomic number 1?',
+          choices: ['Helium', 'Hydrogen', 'Lithium', 'Carbon'],
+          answerIndex: 1,
+          value: 350,
+        },
+        // {
+        //   id: 'bf3',
+        //   category: 'Boss',
+        //   prompt: 'In chess, which piece can only move diagonally?',
+        //   choices: ['Rook', 'Knight', 'Bishop', 'Queen'],
+        //   answerIndex: 2,
+        //   value: 400,
+        // },
+      ];
+
+    default:
+      return [];
+  }
+}
+
+/* ────────────────────── Shop Items ────────────────────── */
+
 const SHOP_ITEMS: ShopItem[] = [
   {
     id: 'fifty_fifty',
@@ -204,6 +445,13 @@ const SHOP_ITEMS: ShopItem[] = [
 
 /* ────────────────────── Room ────────────────────── */
 
+type ActState = {
+  actId: ActId;
+  config: ActConfig;
+  questions: Question[];
+  questionIndex: number;
+};
+
 type Room = {
   code: string;
   createdAt: number;
@@ -213,11 +461,18 @@ type Room = {
   config: RoomConfig;
   playersById: Map<string, Player>;
   socketToPlayerId: Map<string, string>;
+
+  /** The current act state — null only during lobby */
+  actState: ActState | null;
+
+  /** Legacy fields kept for boss mode compatibility */
   questionDeck: Question[];
   questionIndex: number;
   currentQuestion?: CurrentQuestion;
   shopOpen: boolean;
   boss?: BossState;
+  /** Active revive request awaiting host decision */
+  pendingRevive?: ReviveRequest;
 };
 
 const rooms = new Map<string, Room>();
@@ -232,51 +487,6 @@ function getLanIPv4(): string | null {
     }
   }
   return null;
-}
-
-function sampleQuestions(): Question[] {
-  return [
-    {
-      id: 'q1',
-      category: 'General',
-      prompt: 'Which language is used to style web pages?',
-      choices: ['HTML', 'CSS', 'TypeScript', 'Node.js'],
-      answerIndex: 1,
-      value: 100,
-    },
-    {
-      id: 'q2',
-      category: 'Gaming',
-      prompt: 'In Rocket League, what do you hit into the goal?',
-      choices: ['Puck', 'Ball', 'Disc', 'Cube'],
-      answerIndex: 1,
-      value: 100,
-    },
-    {
-      id: 'q3',
-      category: 'Internet',
-      prompt: "What does 'DM' commonly stand for?",
-      choices: ['Direct Message', 'Data Mode', 'Dynamic Module', 'Dual Monitor'],
-      answerIndex: 0,
-      value: 100,
-    },
-    {
-      id: 'q4',
-      category: 'General',
-      prompt: 'Which of these is NOT a database?',
-      choices: ['PostgreSQL', 'MongoDB', 'Redis', 'TailwindCSS'],
-      answerIndex: 3,
-      value: 150,
-    },
-    {
-      id: 'q5',
-      category: 'Gaming',
-      prompt: 'Which company makes the PlayStation?',
-      choices: ['Nintendo', 'Sony', 'Microsoft', 'Valve'],
-      answerIndex: 1,
-      value: 150,
-    },
-  ];
 }
 
 function shuffle<T>(arr: T[]): T[] {
@@ -316,6 +526,13 @@ function toPublicPlayer(p: Player): PublicPlayer {
 
 function getCurrentQuestion(room: Room): Question | undefined {
   if (!room.currentQuestion) return undefined;
+
+  // First check act questions
+  if (room.actState) {
+    return room.actState.questions.find((q) => q.id === room.currentQuestion?.questionId);
+  }
+
+  // Fallback to legacy deck
   return room.questionDeck.find((q) => q.id === room.currentQuestion?.questionId);
 }
 
@@ -337,10 +554,29 @@ function computeRevealAt(room: Room): number {
   return maxEndsAt;
 }
 
-function allActivePlayersLockedIn(room: Room): boolean {
+/**
+ * A player counts as "done" for a question if they either:
+ * - Explicitly locked in, OR
+ * - Their personal timer has expired (base + any freeze bonus)
+ *
+ * This matters when some players have freeze_time bonus:
+ * Player A (no bonus) times out → they're "done"
+ * Player B (freeze bonus) still has time → NOT done yet
+ * → We should NOT force-close until Player B also finishes.
+ */
+function isPlayerDoneForQuestion(p: Player, room: Room): boolean {
+  if (p.lockedIn) return true;
+  if (!room.currentQuestion) return true;
+
+  const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
+  const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
+  return Date.now() >= playerEndsAt;
+}
+
+function allActivePlayersDone(room: Room): boolean {
   const active = activePlayersForQuestion(room);
   if (active.length === 0) return false;
-  return active.every((p) => p.lockedIn);
+  return active.every((p) => isPlayerDoneForQuestion(p, room));
 }
 
 function maybeForceCloseIfAllLocked(room: Room) {
@@ -349,9 +585,9 @@ function maybeForceCloseIfAllLocked(room: Room) {
   if (room.phase !== 'question' && room.phase !== 'boss') return;
   if (room.currentQuestion.forcedRevealAt) return;
 
-  if (allActivePlayersLockedIn(room)) {
+  if (allActivePlayersDone(room)) {
     room.currentQuestion.forcedRevealAt = Date.now();
-    logger.info(`  🔒 All active players locked in — question ended early in room ${room.code}`);
+    logger.info(`  🔒 All active players done — question ended early in room ${room.code}`);
   }
 }
 
@@ -362,7 +598,46 @@ function toPublicQuestion(q: Question): PublicQuestion {
     prompt: q.prompt,
     choices: q.choices,
     value: q.value,
+    hard: q.hard,
   };
+}
+
+/** Get the effective timer duration for the current question */
+function getQuestionDurationMs(room: Room): number {
+  if (room.actState) {
+    return room.actState.config.questionDurationMs;
+  }
+  return room.config.questionDurationMs;
+}
+
+/** Check whether the current question costs hearts when answered wrong */
+function doesQuestionCostHearts(room: Room, question: Question): boolean {
+  if (!room.actState) return true; // legacy behavior: always costs hearts
+
+  const act = room.actState.config;
+
+  // Act says no hearts at risk at all
+  if (!act.heartsAtRisk && !act.heartsOnlyOnHard) return false;
+
+  // Act says only hard questions cost hearts
+  if (act.heartsOnlyOnHard) return !!question.hard;
+
+  // Act says all wrong answers cost hearts
+  return act.heartsAtRisk;
+}
+
+function getActRemainingQuestions(room: Room): number {
+  if (room.actState) {
+    return Math.max(0, room.actState.questions.length - room.actState.questionIndex);
+  }
+  return Math.max(0, room.questionDeck.length - room.questionIndex);
+}
+
+/** Get the shop items available for the current act (progressive unlock) */
+function getShopItemsForAct(room: Room): ShopItem[] {
+  if (!room.actState) return SHOP_ITEMS; // fallback: all items
+  const allowed = room.actState.config.availableShopItems;
+  return SHOP_ITEMS.filter((item) => allowed.includes(item.id));
 }
 
 function roomToPublic(room: Room): PublicRoomState {
@@ -371,6 +646,18 @@ function roomToPublic(room: Room): PublicRoomState {
     .sort((a, b) => a.joinedAt - b.joinedAt);
 
   const q = getCurrentQuestion(room);
+
+  const actInfo = room.actState
+    ? {
+        id: room.actState.actId,
+        name: room.actState.config.name,
+        emoji: room.actState.config.emoji,
+        description: room.actState.config.description,
+        heartsAtRisk: room.actState.config.heartsAtRisk || room.actState.config.heartsOnlyOnHard,
+        questionNumber: room.actState.questionIndex,
+        totalQuestions: room.actState.questions.length,
+      }
+    : undefined;
 
   return {
     code: room.code,
@@ -391,11 +678,26 @@ function roomToPublic(room: Room): PublicRoomState {
         : undefined,
     shop: {
       open: room.shopOpen,
-      items: SHOP_ITEMS,
+      items: getShopItemsForAct(room),
     },
     boss: room.boss,
-    remainingQuestions: Math.max(0, room.questionDeck.length - room.questionIndex),
+    remainingQuestions: getActRemainingQuestions(room),
+    currentAct: actInfo,
   };
+}
+
+function getAvailableActs(room: Room): ActId[] {
+  // Only show next-act options during intermission (after finishing an act's questions)
+  if (!room.actState) {
+    // In lobby, the only option is to start homeroom (handled by game:start)
+    return [];
+  }
+
+  // Only show act transitions during intermission
+  if (room.phase !== 'intermission') return [];
+
+  const currentIdx = ACT_ORDER.indexOf(room.actState.actId);
+  return ACT_ORDER.slice(currentIdx + 1);
 }
 
 function roomToHost(room: Room): HostRoomState {
@@ -407,6 +709,18 @@ function roomToHost(room: Room): HostRoomState {
     currentAnswerIndex: q ? q.answerIndex : undefined,
     correctChoice: q ? q.choices[q.answerIndex] : undefined,
     questionDebug: q,
+    currentAct: room.actState
+      ? {
+          id: room.actState.actId,
+          name: room.actState.config.name,
+          emoji: room.actState.config.emoji,
+          questionNumber: room.actState.questionIndex,
+          totalQuestions: room.actState.questions.length,
+          heartsAtRisk: room.actState.config.heartsAtRisk || room.actState.config.heartsOnlyOnHard,
+        }
+      : undefined,
+    availableActs: getAvailableActs(room),
+    pendingRevive: room.pendingRevive,
   };
 }
 
@@ -434,6 +748,14 @@ function requirePlayer(room: Room, playerId: string): Player {
 }
 
 function nextQuestion(room: Room): Question | null {
+  if (room.actState) {
+    if (room.actState.questionIndex >= room.actState.questions.length) return null;
+    const q = room.actState.questions[room.actState.questionIndex];
+    room.actState.questionIndex += 1;
+    return q;
+  }
+
+  // Legacy fallback
   if (room.questionIndex >= room.questionDeck.length) return null;
   const q = room.questionDeck[room.questionIndex];
   room.questionIndex += 1;
@@ -442,15 +764,18 @@ function nextQuestion(room: Room): Question | null {
 
 function startQuestion(room: Room, q: Question) {
   const now = Date.now();
+  const durationMs = getQuestionDurationMs(room);
+
   // Reset per-question flags
   for (const p of room.playersById.values()) {
     p.lockedIn = false;
   }
+
   room.phase = room.boss ? 'boss' : 'question';
   room.currentQuestion = {
     questionId: q.id,
     startedAt: now,
-    endsAt: now + room.config.questionDurationMs,
+    endsAt: now + durationMs,
     answersByPlayerId: new Map(),
     freezeBonus: new Map(),
     locked: false,
@@ -458,24 +783,34 @@ function startQuestion(room: Room, q: Question) {
   };
 }
 
-/**
- * Arms passive buffs when a passive item is purchased.
- * Called from shop:buy for passive items.
- */
+/** Start a new act: loads its questions and resets act-level state */
+function startAct(room: Room, actId: ActId) {
+  const config = ACT_CONFIGS[actId];
+  const questions = shuffle(getActQuestions(actId));
+
+  room.actState = {
+    actId,
+    config,
+    questions,
+    questionIndex: 0,
+  };
+
+  room.currentQuestion = undefined;
+  room.shopOpen = false;
+
+  logger.info(
+    `  ${config.emoji} Act started: ${config.name} (${questions.length} questions) in room ${room.code}`
+  );
+}
+
 function armPassiveBuff(p: Player, itemId: ShopItemId) {
   if (itemId === 'double_points') p.buffs.doublePoints = true;
   if (itemId === 'shield') p.buffs.shield = true;
-  // buyback_token doesn't need a buff flag — we check inventory directly on elimination
 }
 
 /**
  * Core scoring + passive item auto-trigger logic.
- *
- * Order of operations for each player:
- * 1. Check if they answered correctly
- * 2. If correct: apply score (2x if double_points buff active, consume it)
- * 3. If wrong: lose a heart (unless shield buff active, consume it)
- * 4. If eliminated: check for buyback_token in inventory, auto-revive
+ * Now act-aware: respects heartsAtRisk / heartsOnlyOnHard rules.
  */
 function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
   const q = getCurrentQuestion(room);
@@ -483,6 +818,11 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
 
   room.currentQuestion.locked = true;
   room.phase = 'reveal';
+
+  const heartsAtRisk = doesQuestionCostHearts(room, q);
+  const actConfig = room.actState?.config;
+  const scoreMultiplier = actConfig?.scoreMultiplier ?? 1.0;
+  const coinRewardBase = actConfig?.coinRewardBase ?? Math.floor(q.value / 2);
 
   const results = new Map<string, PlayerRevealPayload>();
 
@@ -513,41 +853,44 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
           logger.info(`  🌟 ${p.name}: double points consumed`);
         }
 
-        const delta = q.value * multiplier;
-        p.score += delta;
-        p.coins += Math.floor(q.value / 2);
+        const scoreDelta = Math.floor(q.value * scoreMultiplier * multiplier);
+        p.score += scoreDelta;
+        p.coins += coinRewardBase;
 
         if (room.boss) {
           room.boss.hp = Math.max(0, room.boss.hp - 1);
         }
       } else {
-        // ── Shield (passive auto-trigger) ──
-        if (p.buffs.shield) {
-          shieldUsed = true;
-          p.buffs.shield = false;
-          const count = p.inventory['shield'] || 0;
-          if (count > 0) p.inventory['shield'] = count - 1;
-          logger.info(`  🛡️ ${p.name}: shield absorbed the hit`);
-          // No heart loss
-        } else {
-          p.lives -= 1;
-          if (p.lives <= 0) {
-            p.lives = 0;
+        // ── Heart Loss Logic (act-aware) ──
+        if (heartsAtRisk) {
+          // Shield check
+          if (p.buffs.shield) {
+            shieldUsed = true;
+            p.buffs.shield = false;
+            const count = p.inventory['shield'] || 0;
+            if (count > 0) p.inventory['shield'] = count - 1;
+            logger.info(`  🛡️ ${p.name}: shield absorbed the hit`);
+          } else {
+            p.lives -= 1;
+            if (p.lives <= 0) {
+              p.lives = 0;
 
-            // ── Buyback Token (passive auto-trigger on elimination) ──
-            const tokenCount = p.inventory['buyback_token'] || 0;
-            if (tokenCount > 0) {
-              buybackUsed = true;
-              p.inventory['buyback_token'] = tokenCount - 1;
-              p.lives = 1;
-              p.eliminated = false;
-              logger.info(`  🪙 ${p.name}: buyback token auto-revived`);
-            } else {
-              p.eliminated = true;
-              logger.info(`  💀 ${p.name}: eliminated`);
+              // Buyback Token check
+              const tokenCount = p.inventory['buyback_token'] || 0;
+              if (tokenCount > 0) {
+                buybackUsed = true;
+                p.inventory['buyback_token'] = tokenCount - 1;
+                p.lives = 1;
+                p.eliminated = false;
+                logger.info(`  🪙 ${p.name}: buyback token auto-revived`);
+              } else {
+                p.eliminated = true;
+                logger.info(`  💀 ${p.name}: eliminated`);
+              }
             }
           }
         }
+        // If hearts NOT at risk: no heart loss at all (Act 1 behavior)
       }
     }
 
@@ -563,6 +906,7 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
       shieldUsed: shieldUsed || undefined,
       doublePointsUsed: doublePointsUsed || undefined,
       buybackUsed: buybackUsed || undefined,
+      heartsAtRisk,
     });
   }
 
@@ -571,14 +915,19 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
 
 function openShop(room: Room, open: boolean) {
   room.shopOpen = open;
-  room.phase = open ? 'shop' : 'reveal'; // closing shop returns to reveal so host can hit Next
+  room.phase = open ? 'shop' : 'reveal';
 }
 
 function maybeEnd(room: Room) {
   const alive = Array.from(room.playersById.values()).filter((p) => !p.eliminated);
   if (alive.length === 0) room.phase = 'ended';
   if (room.boss && room.boss.hp <= 0) room.phase = 'ended';
-  if (room.questionIndex >= room.questionDeck.length && !room.boss) room.phase = 'ended';
+}
+
+/** Check if the current act is finished (all questions answered) */
+function isActFinished(room: Room): boolean {
+  if (!room.actState) return true;
+  return room.actState.questionIndex >= room.actState.questions.length;
 }
 
 /* ────────────────────── Main ────────────────────── */
@@ -627,11 +976,13 @@ async function main() {
             config: { ...DEFAULT_CONFIG },
             playersById: new Map(),
             socketToPlayerId: new Map(),
-            questionDeck: shuffle(sampleQuestions()),
+            actState: null,
+            questionDeck: [],
             questionIndex: 0,
             currentQuestion: undefined,
             shopOpen: false,
             boss: undefined,
+            pendingRevive: undefined,
           };
 
           rooms.set(code, room);
@@ -785,7 +1136,56 @@ async function main() {
       }
     );
 
-    /* ── Game: Start (first question or resume from shop) ── */
+    /* ── Act: Start ──
+     * Host starts a specific act. This loads that act's questions and begins the first one.
+     * Can be used from lobby (to start Act 1) or from reveal/shop (to advance to next act).
+     */
+    socket.on(
+      'act:start',
+      (
+        payload: { code: string; hostKey: string; actId: ActId },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          requireHost(room, (payload?.hostKey || '').trim());
+          const actId = payload?.actId;
+
+          if (!ACT_CONFIGS[actId]) throw new Error('Invalid act.');
+
+          // Can only advance to next act from intermission (or shop during intermission)
+          if (room.actState) {
+            if (room.phase !== 'intermission' && room.phase !== 'shop') {
+              throw new Error('Finish the current act first before starting the next one.');
+            }
+          }
+
+          // Validate act ordering (can only go forward or restart)
+          if (room.actState) {
+            const currentIdx = ACT_ORDER.indexOf(room.actState.actId);
+            const targetIdx = ACT_ORDER.indexOf(actId);
+            if (targetIdx <= currentIdx) {
+              throw new Error(`Cannot go back to ${ACT_CONFIGS[actId].name}. Only forward.`);
+            }
+          }
+
+          startAct(room, actId);
+
+          // Auto-start the first question
+          const q = nextQuestion(room);
+          if (!q) throw new Error('No questions available for this act.');
+          startQuestion(room, q);
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Game: Start (legacy — starts Act 1 Homeroom by default) ── */
     socket.on(
       'game:start',
       (
@@ -798,6 +1198,12 @@ async function main() {
           requireHost(room, (payload?.hostKey || '').trim());
 
           room.shopOpen = false;
+
+          // If no act is active, start Act 1 (Homeroom)
+          if (!room.actState) {
+            startAct(room, 'homeroom');
+          }
+
           const q = nextQuestion(room);
           if (!q) throw new Error('No questions available.');
           startQuestion(room, q);
@@ -872,6 +1278,14 @@ async function main() {
 
           const q = nextQuestion(room);
           if (!q) {
+            // Act is finished — go to intermission so host can open shop or start next act
+            if (room.actState) {
+              room.phase = 'intermission';
+              logger.info(`  🏁 Act "${room.actState.config.name}" finished in room ${room.code}`);
+              ack({ ok: true, data: { room: roomToPublic(room) } });
+              broadcastRoom(io, room);
+              return;
+            }
             room.phase = 'ended';
             ack({ ok: true, data: { room: roomToPublic(room) } });
             broadcastRoom(io, room);
@@ -887,10 +1301,7 @@ async function main() {
       }
     );
 
-    /* ── Shop: Open / Close ──
-     * Shop can only be opened during the reveal phase (between questions).
-     * Closing returns to reveal so the host can then hit "Next Question".
-     */
+    /* ── Shop: Open / Close ── */
     socket.on(
       'shop:open',
       (
@@ -903,11 +1314,22 @@ async function main() {
           requireHost(room, (payload?.hostKey || '').trim());
           const open = !!payload?.open;
 
-          if (open && room.phase !== 'reveal' && room.phase !== 'shop') {
-            throw new Error('Shop can only be opened after revealing an answer.');
+          if (
+            open &&
+            room.phase !== 'reveal' &&
+            room.phase !== 'shop' &&
+            room.phase !== 'intermission'
+          ) {
+            throw new Error(
+              'Shop can only be opened after revealing an answer or during intermission.'
+            );
           }
 
           openShop(room, open);
+          // If we were in intermission and closing the shop, go back to intermission
+          if (!open && room.actState && isActFinished(room)) {
+            room.phase = 'intermission';
+          }
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
         } catch (e) {
@@ -916,10 +1338,7 @@ async function main() {
       }
     );
 
-    /* ── Shop: Buy ──
-     * Players can buy during shop phase.
-     * Passive items auto-arm their buff on purchase.
-     */
+    /* ── Shop: Buy ── */
     socket.on(
       'shop:buy',
       (
@@ -936,12 +1355,18 @@ async function main() {
 
           const item = SHOP_ITEMS.find((i) => i.id === itemId);
           if (!item) throw new Error('Invalid item.');
+
+          // Check item is available in the current act
+          const availableItems = getShopItemsForAct(room);
+          if (!availableItems.find((i) => i.id === itemId)) {
+            throw new Error(`${item.name} is not available in this act.`);
+          }
+
           if (p.coins < item.cost) throw new Error('Not enough coins.');
 
           p.coins -= item.cost;
           p.inventory[item.id] = (p.inventory[item.id] || 0) + 1;
 
-          // Auto-arm passive buffs on purchase
           if (item.kind === 'passive') {
             armPassiveBuff(p, item.id);
           }
@@ -956,10 +1381,7 @@ async function main() {
       }
     );
 
-    /* ── Item: Use (active items only) ──
-     * Only active items can be "used". Passive items auto-trigger.
-     * Active items can only be used during question/boss phase.
-     */
+    /* ── Item: Use (active items only) ── */
     socket.on(
       'item:use',
       (
@@ -990,7 +1412,6 @@ async function main() {
           if (room.currentQuestion.locked) throw new Error('Question is locked.');
           if (p.eliminated) throw new Error('You are eliminated.');
           if (p.lockedIn) throw new Error('Answer locked in.');
-          if (p.lockedIn) throw new Error('You have locked in your answer.');
 
           const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
           const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
@@ -1104,7 +1525,6 @@ async function main() {
           p.lockedIn = true;
           logger.info(`  🔒 ${p.name} locked in (${room.code})`);
 
-          // If everyone has locked in, end the timer early
           maybeForceCloseIfAllLocked(room);
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
@@ -1115,7 +1535,7 @@ async function main() {
       }
     );
 
-    /* ── Player: Buyback (manual coin buyback, separate from token) ── */
+    /* ── Player: Buyback (manual coin buyback) ── */
     socket.on(
       'player:buyback',
       (
@@ -1155,21 +1575,136 @@ async function main() {
           const room = requireRoom(code);
           requireHost(room, (payload?.hostKey || '').trim());
 
-          const questionIds = shuffle(sampleQuestions()).map((q) => q.id);
+          // Start the boss_fight act
+          startAct(room, 'boss_fight');
+
           room.boss = {
             hp: room.config.bossHp,
             maxHp: room.config.bossHp,
-            questionIds,
+            questionIds: room.actState!.questions.map((q) => q.id),
             startedAt: Date.now(),
           };
-
-          room.questionDeck = shuffle(sampleQuestions());
-          room.questionIndex = 0;
-          room.currentQuestion = undefined;
 
           const q = nextQuestion(room);
           if (!q) throw new Error('No boss questions available.');
           startQuestion(room, q);
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Revive: Request (player asks to be revived) ── */
+    socket.on(
+      'revive:request',
+      (payload: { code: string; playerId: string }, ack: (res: Ack<{ pending: true }>) => void) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          const p = requirePlayer(room, (payload?.playerId || '').trim());
+
+          if (!p.eliminated) throw new Error('You are not eliminated.');
+
+          // Cannot request during active question or boss round
+          if (room.phase === 'question' || room.phase === 'boss') {
+            throw new Error('Cannot request a revive during an active question.');
+          }
+
+          // Cannot request during boss_fight act at all
+          if (room.actState?.actId === 'boss_fight') {
+            throw new Error('Revive shrine is not available during the Boss Fight.');
+          }
+
+          // Only one pending revive at a time
+          if (room.pendingRevive) {
+            throw new Error('Another revive request is already pending.');
+          }
+
+          room.pendingRevive = {
+            playerId: p.playerId,
+            playerName: p.name,
+            requestedAt: Date.now(),
+          };
+
+          logger.info(`  🙏 ${p.name} requested a revive in room ${room.code}`);
+
+          ack({ ok: true, data: { pending: true } });
+
+          // Notify the requesting player that their request is pending
+          io.to(p.socketId).emit('revive:pending', { playerName: p.name });
+
+          // Notify host with full state update (includes pendingRevive)
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Revive: Approve (host approves revive) ── */
+    socket.on(
+      'revive:approve',
+      (
+        payload: { code: string; hostKey: string },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          requireHost(room, (payload?.hostKey || '').trim());
+
+          if (!room.pendingRevive) throw new Error('No pending revive request.');
+
+          const p = room.playersById.get(room.pendingRevive.playerId);
+          if (!p) throw new Error('Player not found.');
+
+          // Revive to full health
+          p.eliminated = false;
+          p.lives = room.config.maxLives;
+
+          const playerName = room.pendingRevive.playerName;
+          room.pendingRevive = undefined;
+
+          logger.info(`  ✅ Host approved revive for ${playerName} in room ${room.code}`);
+
+          // Notify the revived player
+          io.to(p.socketId).emit('revive:result', { approved: true, playerName });
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Revive: Decline (host declines revive) ── */
+    socket.on(
+      'revive:decline',
+      (
+        payload: { code: string; hostKey: string },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          requireHost(room, (payload?.hostKey || '').trim());
+
+          if (!room.pendingRevive) throw new Error('No pending revive request.');
+
+          const p = room.playersById.get(room.pendingRevive.playerId);
+          const playerName = room.pendingRevive.playerName;
+          room.pendingRevive = undefined;
+
+          logger.info(`  ❌ Host declined revive for ${playerName} in room ${room.code}`);
+
+          // Notify the declined player
+          if (p) {
+            io.to(p.socketId).emit('revive:result', { approved: false, playerName });
+          }
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);

@@ -6,7 +6,28 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'ended';
+export type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'intermission' | 'ended';
+
+export type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
+
+export type ActConfig = {
+  id: ActId;
+  name: string;
+  emoji: string;
+  description: string;
+  /** Timer duration for questions in this act (ms) */
+  questionDurationMs: number;
+  /** Whether wrong answers cost hearts */
+  heartsAtRisk: boolean;
+  /** Only lose hearts on "hard" questions (used in Pop Quiz) */
+  heartsOnlyOnHard: boolean;
+  /** Coin reward for correct answer (base, before multipliers) */
+  coinRewardBase: number;
+  /** Score value multiplier for this act (e.g. 1.0, 1.5, 2.0) */
+  scoreMultiplier: number;
+  /** Which shop items are available for purchase during this act's shop windows */
+  availableShopItems: ShopItemId[];
+};
 
 export type Player = {
   playerId: string;
@@ -38,6 +59,8 @@ export type PublicQuestion = {
   prompt: string;
   choices: string[];
   value: number;
+  /** Whether this question is tagged as "hard" (affects heart loss in some acts) */
+  hard?: boolean;
 };
 
 /**
@@ -51,7 +74,6 @@ export type PublicQuestion = {
  * ACTIVE (tap to use during a question):
  *   - fifty_fifty: Removes 2 wrong answers. Use during question phase.
  *   - freeze_time: Adds +10s to your timer. Use during question phase.
- *   - call_audience: Spectators vote, you see poll. Use during question phase.
  */
 export type ShopItemId =
   | 'double_points'
@@ -104,6 +126,23 @@ export type PublicRoomState = {
   };
   boss?: BossState;
   remainingQuestions: number;
+
+  /** Current act info */
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    description: string;
+    heartsAtRisk: boolean;
+    questionNumber: number;
+    totalQuestions: number;
+  };
+};
+
+export type ReviveRequest = {
+  playerId: string;
+  playerName: string;
+  requestedAt: number;
 };
 
 export type HostRoomState = {
@@ -113,6 +152,19 @@ export type HostRoomState = {
   currentAnswerIndex?: number;
   correctChoice?: string;
   questionDebug?: JsonValue;
+  /** Act info for host dashboard */
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    questionNumber: number;
+    totalQuestions: number;
+    heartsAtRisk: boolean;
+  };
+  /** Available acts the host can advance to */
+  availableActs?: ActId[];
+  /** If set, a player is requesting to be revived and host must approve/decline */
+  pendingRevive?: ReviveRequest;
 };
 
 export type PlayerRevealPayload = {
@@ -127,6 +179,8 @@ export type PlayerRevealPayload = {
   shieldUsed?: boolean;
   doublePointsUsed?: boolean;
   buybackUsed?: boolean;
+  /** Whether hearts were at risk for this question */
+  heartsAtRisk?: boolean;
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };

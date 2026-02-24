@@ -1,5 +1,6 @@
 'use client';
 
+import { logger } from '@/lib/logger';
 import { getSocket } from '@/lib/socket';
 import type { Ack, PlayerRevealPayload, PublicRoomState, ShopItemId } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
@@ -42,6 +43,11 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const joinAttemptedRef = useRef(false);
   const currentQuestionIdRef = useRef<string | null>(null);
 
+  /** Revive shrine state: 'idle' | 'pending' | 'approved' | 'declined' */
+  const [reviveStatus, setReviveStatus] = useState<'idle' | 'pending' | 'approved' | 'declined'>(
+    'idle'
+  );
+
   const addLog = useCallback((msg: string) => {
     setLog((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 30));
   }, []);
@@ -64,6 +70,46 @@ export default function PlayRoomClient({ code }: { code: string }) {
     []
   );
 
+  // ── Rejoin/resume helper (called on initial connect AND every reconnect) ──
+  const rejoinRoom = useCallback(() => {
+    if (!roomCode) return;
+    const s = getSocket();
+    const currentPid = playerId ?? localStorage.getItem(`${LS_PLAYER_ID_PREFIX}${roomCode}`);
+
+    if (currentPid) {
+      // Try to resume with existing playerId
+      s.emit(
+        'room:resume',
+        { code: roomCode, playerId: currentPid },
+        (ack: Ack<{ room: PublicRoomState; isHost: boolean }>) => {
+          if (!ack.ok) {
+            // Stale playerId — clear it so join can proceed
+            logger.warn({ error: ack.error }, 'room:resume failed, clearing stale playerId');
+            localStorage.removeItem(`${LS_PLAYER_ID_PREFIX}${roomCode}`);
+            setPlayerId(null);
+            joinAttemptedRef.current = false;
+            // Fall back to watch
+            s.emit('room:watch', { code: roomCode }, (watchAck: Ack<{ room: PublicRoomState }>) => {
+              if (watchAck.ok) setRoom(watchAck.data.room);
+            });
+            return;
+          }
+          setError(null);
+          setRoom(ack.data.room);
+          addLog('✅ Resumed');
+        }
+      );
+    } else {
+      // No playerId yet — just watch
+      s.emit('room:watch', { code: roomCode }, (ack: Ack<{ room: PublicRoomState }>) => {
+        if (!ack.ok) return setError(ack.error);
+        setError(null);
+        setRoom(ack.data.room);
+      });
+    }
+  }, [roomCode, playerId, addLog]);
+
+  // ── Socket event listeners (stable, registered once) ──
   useEffect(() => {
     const s = getSocket();
     const onRoomState = (nextRoom: PublicRoomState) => {
@@ -83,12 +129,22 @@ export default function PlayRoomClient({ code }: { code: string }) {
       if (currentId && payload.questionId !== currentId) return;
       setRevealFeedback(payload);
     };
+    const onRevivePending = () => setReviveStatus('pending');
+    const onReviveResult = (payload: { approved: boolean }) => {
+      setReviveStatus(payload.approved ? 'approved' : 'declined');
+      setTimeout(() => setReviveStatus('idle'), 3000);
+    };
 
     s.on('room:state', onRoomState);
     s.on('player:reveal', onPlayerReveal);
+    s.on('revive:pending', onRevivePending);
+    s.on('revive:result', onReviveResult);
+
     return () => {
       s.off('room:state', onRoomState);
       s.off('player:reveal', onPlayerReveal);
+      s.off('revive:pending', onRevivePending);
+      s.off('revive:result', onReviveResult);
     };
   }, []);
 
@@ -97,28 +153,24 @@ export default function PlayRoomClient({ code }: { code: string }) {
     return () => window.clearInterval(t);
   }, []);
 
+  // ── Initial connect + reconnect: re-watch/resume the room ──
   useEffect(() => {
     if (!roomCode) return;
-    emit<{ room: PublicRoomState }>('room:watch', { code: roomCode }, (ack) => {
-      if (!ack.ok) return setError(ack.error);
-      setError(null);
-      setRoom(ack.data.room);
-    });
-  }, [emit, roomCode]);
+    const s = getSocket();
 
-  useEffect(() => {
-    if (!roomCode || !playerId) return;
-    emit<{ room: PublicRoomState; isHost: boolean }>(
-      'room:resume',
-      { code: roomCode, playerId },
-      (ack) => {
-        if (!ack.ok) return console.warn('room:resume failed:', ack.error);
-        setError(null);
-        setRoom(ack.data.room);
-        addLog('✅ Resumed');
-      }
-    );
-  }, [emit, playerId, roomCode, addLog]);
+    // Fire immediately if already connected
+    if (s.connected) rejoinRoom();
+
+    // Also fire on every (re)connect
+    const onConnect = () => {
+      logger.info({ roomCode }, 'socket (re)connected, rejoining room');
+      rejoinRoom();
+    };
+    s.on('connect', onConnect);
+    return () => {
+      s.off('connect', onConnect);
+    };
+  }, [roomCode, rejoinRoom]);
 
   const doJoin = useCallback(
     (joinName: string) => {
@@ -154,18 +206,14 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const submitAnswer = useCallback(
     (answerIndex: number) => {
       if (!playerId) return;
-
-      // Allow changing answers: we always send the latest selection until time runs out / reveal locks.
       const prev = selectedAnswer;
       setSelectedAnswer(answerIndex);
-
       emit<{ accepted: boolean }>(
         'player:answer',
         { code: roomCode, playerId, answerIndex },
         (ack) => {
           if (!ack.ok) {
             setError(ack.error);
-            // Revert optimistic UI if the server rejected (time up / locked / etc.)
             setSelectedAnswer(prev ?? null);
             addLog(`❌ ${ack.error}`);
           } else {
@@ -246,6 +294,20 @@ export default function PlayRoomClient({ code }: { code: string }) {
     });
   }, [emit, playerId, roomCode, addLog]);
 
+  const requestRevive = useCallback(() => {
+    if (!playerId) return;
+    emit<{ pending: true }>('revive:request', { code: roomCode, playerId }, (ack) => {
+      if (!ack.ok) {
+        setError(ack.error);
+        addLog(`❌ Revive: ${ack.error}`);
+      } else {
+        setError(null);
+        setReviveStatus('pending');
+        addLog('🙏 Revive requested — waiting for host…');
+      }
+    });
+  }, [emit, playerId, roomCode, addLog]);
+
   /* ── Derived ── */
 
   const phase = room?.phase ?? 'lobby';
@@ -253,6 +315,7 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const me = room?.players.find((p) => p.playerId === playerId);
   const shopOpen = room?.shop?.open ?? false;
   const isQuestionPhase = phase === 'question' || phase === 'boss';
+  const currentAct = room?.currentAct;
   const revealAt = q ? (q.revealAt ?? q.endsAt) : 0;
   const personalEndsAt = q ? q.endsAt + freezeBonusMs : 0;
   const playerEndsAt = q ? Math.min(revealAt, personalEndsAt) : 0;
@@ -267,7 +330,6 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const lockedInCount = activePlayers.filter((p) => p.lockedIn).length;
   const activeCount = activePlayers.length;
 
-  // Separate inventory into active vs passive for display
   const activeItems = Object.entries(me?.inventory ?? {}).filter(
     ([id, count]) => count > 0 && ITEM_META[id as ShopItemId]?.kind === 'active'
   ) as [ShopItemId, number][];
@@ -276,9 +338,13 @@ export default function PlayRoomClient({ code }: { code: string }) {
     ([id, count]) => count > 0 && ITEM_META[id as ShopItemId]?.kind === 'passive'
   ) as [ShopItemId, number][];
 
+  const isBossAct = currentAct?.id === 'boss_fight';
+  const canRequestRevive =
+    !!me?.eliminated && !isQuestionPhase && !isBossAct && reviveStatus === 'idle';
+
   if (!roomCode) {
     return (
-      <main className="min-h-screen p-6">
+      <main className="min-h-full p-6">
         <div className="mx-auto max-w-md rounded-2xl border p-6">
           <h1 className="text-xl font-bold">Invalid room</h1>
         </div>
@@ -287,7 +353,7 @@ export default function PlayRoomClient({ code }: { code: string }) {
   }
 
   return (
-    <main className="min-h-screen p-6">
+    <main className="min-h-full p-6">
       <div className="mx-auto max-w-3xl space-y-5">
         {/* ── Header + Stats + Buffs ── */}
         <header className="rounded-2xl border p-5">
@@ -299,8 +365,15 @@ export default function PlayRoomClient({ code }: { code: string }) {
                 Code: <span className="font-mono font-semibold">{roomCode}</span>
               </div>
             </div>
-            <div className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-semibold">
-              {phase}
+            <div className="text-right">
+              <div className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-semibold">
+                {phase}
+              </div>
+              {currentAct && (
+                <div className="mt-1 text-xs text-neutral-500">
+                  {currentAct.emoji} {currentAct.name}
+                </div>
+              )}
             </div>
           </div>
 
@@ -319,7 +392,6 @@ export default function PlayRoomClient({ code }: { code: string }) {
             </div>
           )}
 
-          {/* Passive buff indicators */}
           {me &&
             (me.buffs?.doublePoints ||
               me.buffs?.shield ||
@@ -345,6 +417,52 @@ export default function PlayRoomClient({ code }: { code: string }) {
 
           {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
         </header>
+
+        {/* ── Act Banner ── */}
+        {currentAct && (
+          <section
+            className={`rounded-2xl border p-4 ${
+              currentAct.heartsAtRisk ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold">
+                  {currentAct.emoji} {currentAct.name}
+                </h2>
+                <p className="text-xs text-neutral-600">{currentAct.description}</p>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <span
+                  className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                    currentAct.heartsAtRisk
+                      ? 'bg-red-100 text-red-700'
+                      : 'bg-green-100 text-green-700'
+                  }`}
+                >
+                  {currentAct.heartsAtRisk ? '❤️ Hearts at risk' : '🛡️ Hearts safe'}
+                </span>
+                <span className="text-xs text-neutral-500">
+                  Q{currentAct.questionNumber}/{currentAct.totalQuestions}
+                </span>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* ── Intermission ── */}
+        {phase === 'intermission' && (
+          <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5">
+            <h2 className="text-lg font-semibold text-blue-800">🎬 Intermission</h2>
+            <p className="mt-1 text-sm text-blue-700">
+              {currentAct?.name} is complete! Take a breather — the host will start the next act
+              soon.
+            </p>
+            {shopOpen && (
+              <p className="mt-2 text-sm font-medium text-purple-700">🛒 The shop is open!</p>
+            )}
+          </section>
+        )}
 
         {/* ── Join ── */}
         {!playerId && !nameFromUrl && (
@@ -380,9 +498,16 @@ export default function PlayRoomClient({ code }: { code: string }) {
               <h2 className="text-lg font-semibold">
                 {phase === 'boss' ? '🐉 Boss Question' : '❓ Question'}
               </h2>
-              <span className="text-xs text-neutral-500">
-                {q.question.value} pts · {q.question.category}
-              </span>
+              <div className="flex items-center gap-2">
+                {q.question.hard && (
+                  <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-bold text-red-700">
+                    ⚠️ HARD
+                  </span>
+                )}
+                <span className="text-xs text-neutral-500">
+                  {q.question.value} pts · {q.question.category}
+                </span>
+              </div>
             </div>
 
             {freezeBonusMs > 0 && (
@@ -394,7 +519,9 @@ export default function PlayRoomClient({ code }: { code: string }) {
             {/* Timer */}
             <div className="mt-3 rounded-xl border bg-white p-3">
               <div className="flex items-center justify-between text-sm">
-                <span className="font-semibold">{timeUp ? '⏱️ Time’s up' : '⏱️ Time left'}</span>
+                <span className="font-semibold">
+                  {timeUp ? '\u23F1\uFE0F Time\u2019s up' : '\u23F1\uFE0F Time left'}
+                </span>
                 <span className="font-bold tabular-nums">{secondsLeft}s</span>
               </div>
               <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-neutral-200">
@@ -406,6 +533,7 @@ export default function PlayRoomClient({ code }: { code: string }) {
             </div>
 
             <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
+
             {/* Reveal feedback */}
             {q.locked && revealFeedback && (
               <div
@@ -422,12 +550,17 @@ export default function PlayRoomClient({ code }: { code: string }) {
                   : revealFeedback.yourAnswerIndex === null
                     ? '⏱️ No answer submitted'
                     : '❌ Wrong'}
+                {!revealFeedback.heartsAtRisk &&
+                  !revealFeedback.correct &&
+                  revealFeedback.yourAnswerIndex !== null && (
+                    <span className="ml-2 text-green-600">🛡️ No heart lost (safe round)</span>
+                  )}
                 <span className="ml-2 font-medium text-neutral-700">
-                  {revealFeedback.shieldUsed ? '🛡️ Shield used' : ''}
-                  {revealFeedback.doublePointsUsed ? '⭐ Double Points used' : ''}
-                  {revealFeedback.buybackUsed ? '🪙 Buyback used' : ''}
+                  {revealFeedback.shieldUsed ? '🛡️ Shield used ' : ''}
+                  {revealFeedback.doublePointsUsed ? '⭐ Double Points used ' : ''}
+                  {revealFeedback.buybackUsed ? '🪙 Buyback used ' : ''}
                   {revealFeedback.livesDelta !== 0 ? ` · ${revealFeedback.livesDelta} lives` : ''}
-                  {revealFeedback.coinsDelta !== 0 ? ` · ${revealFeedback.coinsDelta} coins` : ''}
+                  {revealFeedback.coinsDelta !== 0 ? ` · +${revealFeedback.coinsDelta} coins` : ''}
                 </span>
               </div>
             )}
@@ -517,16 +650,17 @@ export default function PlayRoomClient({ code }: { code: string }) {
                 ))}
               </div>
             )}
+
             <p className="mt-2 text-xs font-medium text-blue-700">
               {q.locked
                 ? 'Answer revealed.'
                 : timeUp
-                  ? '⏱️ Time’s up — waiting for the host to reveal…'
+                  ? '\u23F1\uFE0F Time\u2019s up \u2014 waiting for the host to reveal\u2026'
                   : me?.lockedIn
-                    ? '🔒 Locked in — waiting for the host to reveal…'
+                    ? '🔒 Locked in \u2014 waiting for the host to reveal\u2026'
                     : selectedAnswer === null
                       ? 'Tap an answer to submit. You can change it until you lock in or time runs out.'
-                      : `Selected ${String.fromCharCode(65 + selectedAnswer)} — tap another option to change before you lock in or time runs out.`}
+                      : `Selected ${String.fromCharCode(65 + selectedAnswer)} \u2014 tap another option to change before you lock in or time runs out.`}
             </p>
           </section>
         )}
@@ -536,18 +670,91 @@ export default function PlayRoomClient({ code }: { code: string }) {
           <section className="rounded-2xl border border-red-200 bg-red-50 p-5">
             <h2 className="text-lg font-semibold text-red-800">💀 You&apos;re Eliminated</h2>
             <p className="mt-1 text-sm text-red-700">
-              Wait for the shop to open, then buy back in with coins.
+              Buy back in with coins, or request a revive from the host.
             </p>
-            {shopOpen && (
-              <button
-                type="button"
-                onClick={doBuyback}
-                className="mt-3 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700"
-              >
-                🪙 Buyback ({room?.config.buybackCostCoins} coins)
-              </button>
-            )}
+            <div className="mt-3 flex flex-wrap gap-2">
+              {shopOpen && (
+                <button
+                  type="button"
+                  onClick={doBuyback}
+                  className="rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700"
+                >
+                  🪙 Buyback ({room?.config.buybackCostCoins} coins)
+                </button>
+              )}
+              {canRequestRevive && (
+                <button
+                  type="button"
+                  onClick={requestRevive}
+                  className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+                >
+                  🙏 Request Revive
+                </button>
+              )}
+              {isBossAct && (
+                <p className="mt-1 text-xs text-neutral-500">
+                  Revive shrine is not available during the Boss Fight.
+                </p>
+              )}
+            </div>
           </section>
+        )}
+
+        {/* ── Revive Pending Modal (blocks player screen until host decides) ── */}
+        {reviveStatus === 'pending' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-emerald-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">🙏</div>
+                <h2 className="mt-4 text-2xl font-bold text-emerald-800">Revive Shrine</h2>
+                <p className="mt-3 text-base text-neutral-700">
+                  Your request has been sent to the host!
+                </p>
+                <p className="mt-2 text-sm text-neutral-500">
+                  Complete the forfeit and wait for the host&apos;s decision…
+                </p>
+                <div className="mt-6 flex items-center justify-center gap-2">
+                  <div className="h-2 w-2 animate-bounce rounded-full bg-emerald-500" />
+                  <div
+                    className="h-2 w-2 animate-bounce rounded-full bg-emerald-500"
+                    style={{ animationDelay: '0.15s' }}
+                  />
+                  <div
+                    className="h-2 w-2 animate-bounce rounded-full bg-emerald-500"
+                    style={{ animationDelay: '0.3s' }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Revive Result Toast ── */}
+        {reviveStatus === 'approved' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-green-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">🎉</div>
+                <h2 className="mt-4 text-2xl font-bold text-green-800">You&apos;re Back!</h2>
+                <p className="mt-2 text-base text-neutral-700">
+                  The host approved your revive. Full health restored!
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+        {reviveStatus === 'declined' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-red-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">😔</div>
+                <h2 className="mt-4 text-2xl font-bold text-red-800">Request Declined</h2>
+                <p className="mt-2 text-base text-neutral-700">
+                  The host declined your revive. Better luck next time!
+                </p>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* ── Shop ── */}

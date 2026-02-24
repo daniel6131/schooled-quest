@@ -36,7 +36,7 @@ export default function HostCreate() {
   }, [hostName, router]);
 
   return (
-    <main className="flex min-h-screen items-center justify-center p-6">
+    <main className="flex min-h-full items-center justify-center p-6">
       <div className="w-full max-w-md space-y-3 rounded-2xl border p-6">
         <h1 className="text-xl font-bold">Creating room…</h1>
         {error && <p className="text-sm text-red-600">{error}</p>}
