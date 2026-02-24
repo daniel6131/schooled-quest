@@ -6,7 +6,15 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'intermission' | 'ended';
+export type Phase =
+  | 'lobby'
+  | 'countdown'
+  | 'question'
+  | 'reveal'
+  | 'shop'
+  | 'boss'
+  | 'intermission'
+  | 'ended';
 
 export type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
 
@@ -107,6 +115,7 @@ export type PublicRoomState = {
   config: {
     maxLives: number;
     questionDurationMs: number;
+    countdownMs: number;
     startingCoins: number;
     buybackCostCoins: number;
     bossHp: number;
@@ -114,6 +123,8 @@ export type PublicRoomState = {
   players: Player[];
   currentQuestion?: {
     question: PublicQuestion;
+    /** When the countdown finishes and the question timer starts */
+    countdownEndsAt?: number;
     startedAt: number;
     endsAt: number;
     /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
@@ -189,3 +200,11 @@ export type PlayerRevealPayload = {
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };
+
+export type PackSummary = {
+  id: string;
+  name: string;
+  description: string;
+  questionCounts: Record<string, number>;
+  totalQuestions: number;
+};

@@ -333,8 +333,16 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const q = room?.currentQuestion;
   const me = room?.players.find((p) => p.playerId === playerId);
   const shopOpen = room?.shop?.open ?? false;
+  const isCountdown = phase === 'countdown';
   const isQuestionPhase = phase === 'question' || phase === 'boss';
   const currentAct = room?.currentAct;
+
+  // ── Countdown state ──
+  const countdownEndsAt = q?.countdownEndsAt ?? 0;
+  const countdownMsLeft = isCountdown ? Math.max(0, countdownEndsAt - now) : 0;
+  const countdownSecondsLeft = Math.ceil(countdownMsLeft / 1000);
+
+  // ── Question timer (only ticks after countdown ends) ──
   const revealAt = q ? (q.revealAt ?? q.endsAt) : 0;
   const personalEndsAt = q ? q.endsAt + freezeBonusMs : 0;
   const playerEndsAt = q ? Math.min(revealAt, personalEndsAt) : 0;
@@ -493,10 +501,16 @@ export default function PlayRoomClient({ code }: { code: string }) {
           </section>
         )}
 
-        {/* ── Join ── */}
-        {!playerId && !nameFromUrl && (
+        {/* ── Join / Spectate ── */}
+        {!playerId && (
           <section className="rounded-2xl border p-5">
-            <h2 className="text-lg font-semibold">Join</h2>
+            <h2 className="text-lg font-semibold">{phase === 'lobby' ? 'Join' : 'Spectating'}</h2>
+            <p className="mt-1 text-sm text-neutral-600">
+              {phase === 'lobby'
+                ? 'Enter a name to join the game.'
+                : 'Game already started — you can watch, but joining is disabled.'}
+            </p>
+
             <div className="mt-3 flex gap-2">
               <input
                 className="w-full rounded-xl border px-3 py-2 text-sm"
@@ -505,18 +519,18 @@ export default function PlayRoomClient({ code }: { code: string }) {
                 onChange={(e) => setName(e.target.value)}
               />
               <button
-                className="rounded-xl border px-4 py-2 text-sm font-medium hover:bg-neutral-50"
+                className="rounded-xl border px-4 py-2 text-sm font-medium hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
                 type="button"
+                disabled={phase !== 'lobby' || !name.trim()}
                 onClick={() => doJoin(name)}
               >
                 Join
               </button>
             </div>
-          </section>
-        )}
-        {!playerId && nameFromUrl && (
-          <section className="rounded-2xl border p-5">
-            <p className="text-sm text-neutral-600">Joining as {nameFromUrl}…</p>
+
+            {nameFromUrl && phase === 'lobby' && !playerId && !error && (
+              <p className="mt-2 text-xs text-neutral-500">Auto-joining as {nameFromUrl}…</p>
+            )}
           </section>
         )}
 
@@ -525,7 +539,11 @@ export default function PlayRoomClient({ code }: { code: string }) {
           <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">
-                {phase === 'boss' ? '🐉 Boss Question' : '❓ Question'}
+                {phase === 'boss'
+                  ? '🐉 Boss Question'
+                  : isCountdown
+                    ? '⏳ Get Ready!'
+                    : '❓ Question'}
               </h2>
               <div className="flex items-center gap-2">
                 {q.question.hard && (
@@ -539,183 +557,211 @@ export default function PlayRoomClient({ code }: { code: string }) {
               </div>
             </div>
 
-            {freezeBonusMs > 0 && (
-              <p className="mt-1 text-xs font-medium text-blue-600">
-                ⏱️ +{freezeBonusMs / 1000}s bonus time!
-              </p>
+            {/* ── Countdown Overlay ── */}
+            {isCountdown && (
+              <div className="mt-4 flex flex-col items-center justify-center py-8">
+                <div className="text-7xl font-black text-amber-600 tabular-nums">
+                  {countdownSecondsLeft || '🚀'}
+                </div>
+                <p className="mt-3 text-sm font-semibold text-amber-700">
+                  {countdownSecondsLeft > 0 ? 'Question incoming…' : 'Go!'}
+                </p>
+              </div>
             )}
 
-            {/* Timer */}
-            <div className="mt-3 rounded-xl border bg-white p-3">
-              <div className="flex items-center justify-between text-sm">
-                <span className="font-semibold">
-                  {timeUp ? '\u23F1\uFE0F Time\u2019s up' : '\u23F1\uFE0F Time left'}
-                </span>
-                <span className="font-bold tabular-nums">{secondsLeft}s</span>
-              </div>
-              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-neutral-200">
-                <div
-                  className="h-2 bg-blue-500 transition-[width]"
-                  style={{ width: `${Math.round(remainingFrac * 100)}%` }}
-                />
-              </div>
+            {/* ── Question Content (hidden during countdown) ── */}
+            {!isCountdown && (
+              <>
+                {freezeBonusMs > 0 && (
+                  <p className="mt-1 text-xs font-medium text-blue-600">
+                    ⏱️ +{freezeBonusMs / 1000}s bonus time!
+                  </p>
+                )}
 
-              {/* Speed Bonus Preview */}
-              {speedBonusMax > 0 && isQuestionPhase && !q.locked && !me?.eliminated && (
-                <div className="mt-2 flex items-center justify-between">
-                  <span className="text-xs font-medium text-amber-700">⚡ Speed Bonus</span>
-                  <span
-                    className={`text-sm font-bold tabular-nums ${
-                      me?.lockedIn
-                        ? 'text-green-600'
-                        : displaySpeedBonus > 0
-                          ? 'text-amber-600'
-                          : 'text-neutral-400'
+                {/* Timer / Countdown */}
+                <div className="mt-3 rounded-xl border bg-white p-3">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-semibold">
+                      {timeUp ? '\u23F1\uFE0F Time\u2019s up' : '\u23F1\uFE0F Time left'}
+                    </span>
+                    <span className="font-bold tabular-nums">{secondsLeft}s</span>
+                  </div>
+                  <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-neutral-200">
+                    <div
+                      className="h-2 bg-blue-500 transition-[width]"
+                      style={{ width: `${Math.round(remainingFrac * 100)}%` }}
+                    />
+                  </div>
+
+                  {/* Speed Bonus Preview */}
+                  {speedBonusMax > 0 && isQuestionPhase && !q.locked && !me?.eliminated && (
+                    <div className="mt-2 flex items-center justify-between">
+                      <span className="text-xs font-medium text-amber-700">⚡ Speed Bonus</span>
+                      <span
+                        className={`text-sm font-bold tabular-nums ${
+                          me?.lockedIn
+                            ? 'text-green-600'
+                            : displaySpeedBonus > 0
+                              ? 'text-amber-600'
+                              : 'text-neutral-400'
+                        }`}
+                      >
+                        {me?.lockedIn
+                          ? `🔒 +${displaySpeedBonus}`
+                          : timeUp
+                            ? '+0'
+                            : `+${displaySpeedBonus}`}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
+
+                {/* Reveal feedback */}
+                {q.locked && revealFeedback && (
+                  <div
+                    className={`mt-3 rounded-xl border p-3 text-sm font-semibold ${
+                      revealFeedback.correct
+                        ? 'border-green-300 bg-green-50 text-green-800'
+                        : revealFeedback.yourAnswerIndex === null
+                          ? 'border-amber-300 bg-amber-50 text-amber-800'
+                          : 'border-red-300 bg-red-50 text-red-800'
                     }`}
                   >
-                    {me?.lockedIn
-                      ? `🔒 +${displaySpeedBonus}`
-                      : timeUp
-                        ? '+0'
-                        : `+${displaySpeedBonus}`}
-                  </span>
-                </div>
-              )}
-            </div>
-
-            <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
-
-            {/* Reveal feedback */}
-            {q.locked && revealFeedback && (
-              <div
-                className={`mt-3 rounded-xl border p-3 text-sm font-semibold ${
-                  revealFeedback.correct
-                    ? 'border-green-300 bg-green-50 text-green-800'
-                    : revealFeedback.yourAnswerIndex === null
-                      ? 'border-amber-300 bg-amber-50 text-amber-800'
-                      : 'border-red-300 bg-red-50 text-red-800'
-                }`}
-              >
-                {revealFeedback.correct
-                  ? `✅ Correct! +${revealFeedback.scoreDelta} pts`
-                  : revealFeedback.yourAnswerIndex === null
-                    ? '⏱️ No answer submitted'
-                    : '❌ Wrong'}
-                {revealFeedback.correct && revealFeedback.speedBonus
-                  ? ` (⚡ +${revealFeedback.speedBonus} speed bonus)`
-                  : null}
-                {!revealFeedback.heartsAtRisk &&
-                  !revealFeedback.correct &&
-                  revealFeedback.yourAnswerIndex !== null && (
-                    <span className="ml-2 text-green-600">🛡️ No heart lost (safe round)</span>
-                  )}
-                <span className="ml-2 font-medium text-neutral-700">
-                  {revealFeedback.shieldUsed ? '🛡️ Shield used ' : ''}
-                  {revealFeedback.doublePointsUsed ? '⭐ Double Points used ' : ''}
-                  {revealFeedback.buybackUsed ? '🪙 Buyback used ' : ''}
-                  {revealFeedback.livesDelta !== 0 ? ` · ${revealFeedback.livesDelta} lives` : ''}
-                  {revealFeedback.coinsDelta !== 0 ? ` · +${revealFeedback.coinsDelta} coins` : ''}
-                </span>
-              </div>
-            )}
-
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {q.question.choices.map((choice, i) => {
-                const isRemoved = removedIndexes?.includes(i);
-                const isSelected = selectedAnswer === i;
-                const showReveal = q.locked && typeof revealedCorrectIndex === 'number';
-                const isCorrect = showReveal && i === revealedCorrectIndex;
-                const yourIdx = revealFeedback?.yourAnswerIndex ?? selectedAnswer;
-                const isYourPick = yourIdx === i;
-                const isWrongPick = showReveal && isYourPick && !isCorrect;
-                return (
-                  <button
-                    key={i}
-                    type="button"
-                    disabled={
-                      q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn || !!isRemoved
-                    }
-                    onClick={() => submitAnswer(i)}
-                    className={`rounded-xl border-2 px-4 py-3 text-left text-sm font-medium transition-all ${
-                      isRemoved
-                        ? 'border-neutral-200 bg-neutral-100 text-neutral-400 line-through'
-                        : isCorrect
-                          ? 'border-green-500 bg-green-50 text-green-800'
-                          : isWrongPick
-                            ? 'border-red-500 bg-red-50 text-red-800'
-                            : isSelected
-                              ? 'border-blue-500 bg-blue-50 text-blue-800'
-                              : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
-                    } disabled:cursor-not-allowed`}
-                  >
-                    <span className="mr-2 font-bold text-neutral-400">
-                      {String.fromCharCode(65 + i)}
-                    </span>
-                    {choice}
-                    {showReveal
-                      ? isCorrect
-                        ? ' ✅'
-                        : isWrongPick
-                          ? ' ❌'
-                          : ''
-                      : isSelected
-                        ? ' ✓'
+                    {revealFeedback.correct
+                      ? `✅ Correct! +${revealFeedback.scoreDelta} pts`
+                      : revealFeedback.yourAnswerIndex === null
+                        ? '⏱️ No answer submitted'
+                        : '❌ Wrong'}
+                    {revealFeedback.correct && revealFeedback.speedBonus
+                      ? ` (⚡ +${revealFeedback.speedBonus} speed bonus)`
+                      : null}
+                    {!revealFeedback.heartsAtRisk &&
+                      !revealFeedback.correct &&
+                      revealFeedback.yourAnswerIndex !== null && (
+                        <span className="ml-2 text-green-600">🛡️ No heart lost (safe round)</span>
+                      )}
+                    <span className="ml-2 font-medium text-neutral-700">
+                      {revealFeedback.shieldUsed ? '🛡️ Shield used ' : ''}
+                      {revealFeedback.doublePointsUsed ? '⭐ Double Points used ' : ''}
+                      {revealFeedback.buybackUsed ? '🪙 Buyback used ' : ''}
+                      {revealFeedback.livesDelta !== 0
+                        ? ` · ${revealFeedback.livesDelta} lives`
                         : ''}
-                  </button>
-                );
-              })}
-            </div>
+                      {revealFeedback.coinsDelta !== 0
+                        ? ` · +${revealFeedback.coinsDelta} coins`
+                        : ''}
+                    </span>
+                  </div>
+                )}
 
-            {/* Lock In */}
-            {isQuestionPhase && !q.locked && !me?.eliminated && activeCount > 0 && (
-              <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-white p-3">
-                <div className="text-xs font-semibold text-neutral-700">
-                  🔒 Locked in:{' '}
-                  <span className="tabular-nums">
-                    {lockedInCount}/{activeCount}
-                  </span>
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {q.question.choices.map((choice, i) => {
+                    const isRemoved = removedIndexes?.includes(i);
+                    const isSelected = selectedAnswer === i;
+                    const showReveal = q.locked && typeof revealedCorrectIndex === 'number';
+                    const isCorrect = showReveal && i === revealedCorrectIndex;
+                    const yourIdx = revealFeedback?.yourAnswerIndex ?? selectedAnswer;
+                    const isYourPick = yourIdx === i;
+                    const isWrongPick = showReveal && isYourPick && !isCorrect;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        disabled={
+                          isCountdown ||
+                          q.locked ||
+                          timeUp ||
+                          !!me?.eliminated ||
+                          !!me?.lockedIn ||
+                          !!isRemoved
+                        }
+                        onClick={() => submitAnswer(i)}
+                        className={`rounded-xl border-2 px-4 py-3 text-left text-sm font-medium transition-all ${
+                          isRemoved
+                            ? 'border-neutral-200 bg-neutral-100 text-neutral-400 line-through'
+                            : isCorrect
+                              ? 'border-green-500 bg-green-50 text-green-800'
+                              : isWrongPick
+                                ? 'border-red-500 bg-red-50 text-red-800'
+                                : isSelected
+                                  ? 'border-blue-500 bg-blue-50 text-blue-800'
+                                  : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
+                        } disabled:cursor-not-allowed`}
+                      >
+                        <span className="mr-2 font-bold text-neutral-400">
+                          {String.fromCharCode(65 + i)}
+                        </span>
+                        {choice}
+                        {showReveal
+                          ? isCorrect
+                            ? ' ✅'
+                            : isWrongPick
+                              ? ' ❌'
+                              : ''
+                          : isSelected
+                            ? ' ✓'
+                            : ''}
+                      </button>
+                    );
+                  })}
                 </div>
-                <button
-                  type="button"
-                  onClick={lockIn}
-                  disabled={timeUp || !!me?.lockedIn || selectedAnswer === null}
-                  className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {me?.lockedIn ? '✅ Locked In' : '🔒 Lock In'}
-                </button>
-              </div>
-            )}
 
-            {/* Active items — usable during question */}
-            {isQuestionPhase && activeItems.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-2 border-t border-amber-200 pt-3">
-                <span className="self-center text-xs text-neutral-500">Use:</span>
-                {activeItems.map(([itemId, count]) => (
-                  <button
-                    key={itemId}
-                    type="button"
-                    disabled={q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn}
-                    onClick={() => handleUseItem(itemId)}
-                    className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {ITEM_META[itemId].emoji} {ITEM_META[itemId].name}
-                    {count > 1 && ` ×${count}`}
-                  </button>
-                ))}
-              </div>
-            )}
+                {/* Lock In */}
+                {isQuestionPhase && !q.locked && !me?.eliminated && activeCount > 0 && (
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-white p-3">
+                    <div className="text-xs font-semibold text-neutral-700">
+                      🔒 Locked in:{' '}
+                      <span className="tabular-nums">
+                        {lockedInCount}/{activeCount}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={lockIn}
+                      disabled={timeUp || !!me?.lockedIn || selectedAnswer === null}
+                      className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {me?.lockedIn ? '✅ Locked In' : '🔒 Lock In'}
+                    </button>
+                  </div>
+                )}
 
-            <p className="mt-2 text-xs font-medium text-blue-700">
-              {q.locked
-                ? 'Answer revealed.'
-                : timeUp
-                  ? '\u23F1\uFE0F Time\u2019s up \u2014 waiting for the host to reveal\u2026'
-                  : me?.lockedIn
-                    ? '🔒 Locked in \u2014 waiting for the host to reveal\u2026'
-                    : selectedAnswer === null
-                      ? 'Tap an answer to submit. You can change it until you lock in or time runs out.'
-                      : `Selected ${String.fromCharCode(65 + selectedAnswer)} \u2014 tap another option to change before you lock in or time runs out.`}
-            </p>
+                {/* Active items — usable during question */}
+                {isQuestionPhase && activeItems.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-amber-200 pt-3">
+                    <span className="self-center text-xs text-neutral-500">Use:</span>
+                    {activeItems.map(([itemId, count]) => (
+                      <button
+                        key={itemId}
+                        type="button"
+                        disabled={q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn}
+                        onClick={() => handleUseItem(itemId)}
+                        className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {ITEM_META[itemId].emoji} {ITEM_META[itemId].name}
+                        {count > 1 && ` ×${count}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <p className="mt-2 text-xs font-medium text-blue-700">
+                  {isCountdown
+                    ? 'Read the question — answers open in a moment!'
+                    : q.locked
+                      ? 'Answer revealed.'
+                      : timeUp
+                        ? '\u23F1\uFE0F Time\u2019s up \u2014 waiting for the host to reveal\u2026'
+                        : me?.lockedIn
+                          ? '🔒 Locked in \u2014 waiting for the host to reveal\u2026'
+                          : selectedAnswer === null
+                            ? 'Tap an answer to submit. You can change it until you lock in or time runs out.'
+                            : `Selected ${String.fromCharCode(65 + selectedAnswer)} \u2014 tap another option to change before you lock in or time runs out.`}
+                </p>
+              </>
+            )}
           </section>
         )}
 
@@ -905,6 +951,62 @@ export default function PlayRoomClient({ code }: { code: string }) {
             )}
           </section>
         )}
+
+        {/* ── Final Results ── */}
+        {phase === 'ended' &&
+          (room?.players.length ?? 0) > 0 &&
+          (() => {
+            const sorted = [...(room?.players ?? [])].sort((a, b) => b.score - a.score);
+            const podium = sorted.slice(0, 3);
+            const medals = ['🥇', '🥈', '🥉'];
+            const myRank = sorted.findIndex((p) => p.playerId === playerId);
+
+            return (
+              <section className="rounded-2xl border-2 border-amber-300 bg-linear-to-b from-amber-50 to-white p-6">
+                <h2 className="text-center text-2xl font-bold">🏆 Game Over!</h2>
+
+                {/* Podium */}
+                <div className="mt-5 flex items-end justify-center gap-3">
+                  {podium.map((p, i) => (
+                    <div
+                      key={p.playerId}
+                      className={`flex flex-col items-center rounded-xl border p-3 ${
+                        i === 0
+                          ? 'order-2 min-w-28 border-amber-300 bg-amber-50'
+                          : i === 1
+                            ? 'order-1 min-w-24 border-neutral-300 bg-neutral-50'
+                            : 'order-3 min-w-24 border-orange-200 bg-orange-50'
+                      }`}
+                    >
+                      <span className="text-2xl">{medals[i]}</span>
+                      <span className="mt-1 text-sm font-bold">
+                        {p.name}
+                        {p.playerId === playerId && ' (you)'}
+                      </span>
+                      <span className="mt-0.5 text-lg font-black tabular-nums">{p.score}</span>
+                      <span className="text-xs text-neutral-500">points</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Your stats */}
+                {me && (
+                  <div className="mt-5 rounded-xl border bg-white p-4 text-center">
+                    <p className="text-sm font-semibold">
+                      You finished{' '}
+                      <span className="text-lg font-black text-blue-600">#{myRank + 1}</span> of{' '}
+                      {sorted.length}
+                    </p>
+                    <div className="mt-2 flex justify-center gap-4 text-sm">
+                      <span>⭐ {me.score} pts</span>
+                      <span>🪙 {me.coins} coins</span>
+                      <span>❤️ {me.lives} lives</span>
+                    </div>
+                  </div>
+                )}
+              </section>
+            );
+          })()}
 
         {/* ── Scoreboard ── */}
         <section className="rounded-2xl border p-5">

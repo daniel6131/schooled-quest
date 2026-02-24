@@ -1,4 +1,11 @@
 import { logger } from '@/lib/logger';
+import {
+  getDefaultPackId,
+  getPackQuestions,
+  hasAnyPacks,
+  listPacks,
+  loadQuestionPacks,
+} from '@/lib/questionLoader';
 import express from 'express';
 import { createServer } from 'http';
 import { customAlphabet, nanoid } from 'nanoid';
@@ -8,7 +15,15 @@ import { Server } from 'socket.io';
 
 /* ────────────────────── Types ────────────────────── */
 
-type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'intermission' | 'ended';
+type Phase =
+  | 'lobby'
+  | 'countdown'
+  | 'question'
+  | 'reveal'
+  | 'shop'
+  | 'boss'
+  | 'intermission'
+  | 'ended';
 type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
 
 type ActConfig = {
@@ -68,6 +83,7 @@ type PublicQuestion = Omit<Question, 'answerIndex'>;
 type RoomConfig = {
   maxLives: number;
   questionDurationMs: number;
+  countdownMs: number;
   startingCoins: number;
   buybackCostCoins: number;
   bossHp: number;
@@ -75,6 +91,8 @@ type RoomConfig = {
 
 type CurrentQuestion = {
   questionId: string;
+  /** When the countdown ends and the question timer starts */
+  countdownEndsAt?: number;
   startedAt: number;
   endsAt: number;
   answersByPlayerId: Map<string, number>;
@@ -119,6 +137,8 @@ type PublicRoomState = {
   players: PublicPlayer[];
   currentQuestion?: {
     question: PublicQuestion;
+    /** When the countdown finishes and the question timer starts */
+    countdownEndsAt?: number;
     startedAt: number;
     endsAt: number;
     revealAt: number;
@@ -190,9 +210,12 @@ const handle = nextApp.getRequestHandler();
 
 const makeCode = customAlphabet('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 5);
 
+const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 30);
+
 const DEFAULT_CONFIG: RoomConfig = {
   maxLives: 3,
   questionDurationMs: 25_000, // fallback, acts override this
+  countdownMs: 3_000, // 3-2-1 countdown before each question
   startingCoins: 150,
   buybackCostCoins: 200,
   bossHp: 6,
@@ -264,152 +287,11 @@ const ACT_ORDER: ActId[] = ['homeroom', 'pop_quiz', 'field_trip', 'boss_fight'];
 /* ────────────────────── Question Bank (per act) ────────────────────── */
 
 /**
- * Sample questions organized by act. In production these would come from a DB or JSON file.
- * For now we have a handful per act for testing.
+ * Get questions for an act from the room's selected question pack.
+ * Falls back to empty array if pack or act not found.
  */
-function getActQuestions(actId: ActId): Question[] {
-  switch (actId) {
-    case 'homeroom':
-      return [
-        {
-          id: 'hr1',
-          category: 'General',
-          prompt: 'Which language is used to style web pages?',
-          choices: ['HTML', 'CSS', 'TypeScript', 'Node.js'],
-          answerIndex: 1,
-          value: 100,
-        },
-        {
-          id: 'hr2',
-          category: 'Gaming',
-          prompt: 'In Rocket League, what do you hit into the goal?',
-          choices: ['Puck', 'Ball', 'Disc', 'Cube'],
-          answerIndex: 1,
-          value: 100,
-        },
-        {
-          id: 'hr3',
-          category: 'Internet',
-          prompt: "What does 'DM' commonly stand for?",
-          choices: ['Direct Message', 'Data Mode', 'Dynamic Module', 'Dual Monitor'],
-          answerIndex: 0,
-          value: 100,
-        },
-        {
-          id: 'hr4',
-          category: 'General',
-          prompt: 'Which of these is NOT a database?',
-          choices: ['PostgreSQL', 'MongoDB', 'Redis', 'TailwindCSS'],
-          answerIndex: 3,
-          value: 150,
-        },
-        {
-          id: 'hr5',
-          category: 'Gaming',
-          prompt: 'Which company makes the PlayStation?',
-          choices: ['Nintendo', 'Sony', 'Microsoft', 'Valve'],
-          answerIndex: 1,
-          value: 100,
-        },
-      ];
-
-    case 'pop_quiz':
-      return [
-        {
-          id: 'pq1',
-          category: 'Science',
-          prompt: 'What is the chemical symbol for gold?',
-          choices: ['Go', 'Gd', 'Au', 'Ag'],
-          answerIndex: 2,
-          value: 150,
-        },
-        {
-          id: 'pq2',
-          category: 'Geography',
-          prompt: 'What is the capital of Australia?',
-          choices: ['Sydney', 'Melbourne', 'Canberra', 'Perth'],
-          answerIndex: 2,
-          value: 150,
-        },
-        {
-          id: 'pq3',
-          category: 'Music',
-          prompt: "Which artist released the album 'Blonde'?",
-          choices: ['Tyler, The Creator', 'Kanye West', 'Frank Ocean', 'Childish Gambino'],
-          answerIndex: 2,
-          value: 200,
-          hard: true,
-        },
-        {
-          id: 'pq4',
-          category: 'History',
-          prompt: 'In which year did the Berlin Wall fall?',
-          choices: ['1987', '1989', '1991', '1993'],
-          answerIndex: 1,
-          value: 200,
-          hard: true,
-        },
-      ];
-
-    case 'field_trip':
-      return [
-        {
-          id: 'ft1',
-          category: 'Science',
-          prompt: 'How many bones are in the adult human body?',
-          choices: ['186', '196', '206', '216'],
-          answerIndex: 2,
-          value: 200,
-        },
-        {
-          id: 'ft2',
-          category: 'Geography',
-          prompt: 'Which country has the most time zones?',
-          choices: ['Russia', 'USA', 'France', 'China'],
-          answerIndex: 2,
-          value: 250,
-        },
-        {
-          id: 'ft3',
-          category: 'Movies',
-          prompt: "Who directed 'Inception'?",
-          choices: ['Steven Spielberg', 'Christopher Nolan', 'Denis Villeneuve', 'James Cameron'],
-          answerIndex: 1,
-          value: 200,
-        },
-      ];
-
-    case 'boss_fight':
-      return [
-        {
-          id: 'bf1',
-          category: 'Boss',
-          prompt: 'What year was the first iPhone released?',
-          choices: ['2005', '2006', '2007', '2008'],
-          answerIndex: 2,
-          value: 300,
-        },
-        {
-          id: 'bf2',
-          category: 'Boss',
-          prompt: 'Which element has the atomic number 1?',
-          choices: ['Helium', 'Hydrogen', 'Lithium', 'Carbon'],
-          answerIndex: 1,
-          value: 350,
-        },
-        {
-          id: 'bf3',
-          category: 'Boss',
-          prompt: 'In chess, which piece can only move diagonally?',
-          choices: ['Rook', 'Knight', 'Bishop', 'Queen'],
-          answerIndex: 2,
-          value: 400,
-        },
-      ];
-
-    default:
-      return [];
-  }
+function getActQuestions(room: Room, actId: ActId): Question[] {
+  return getPackQuestions(room.packId, actId);
 }
 
 /* ────────────────────── Shop Items ────────────────────── */
@@ -464,10 +346,12 @@ type ActState = {
 type Room = {
   code: string;
   createdAt: number;
+  lastActivityAt: number;
   hostKey: string;
   hostSocketId: string | null;
   phase: Phase;
   config: RoomConfig;
+  packId: string;
   playersById: Map<string, Player>;
   socketToPlayerId: Map<string, string>;
 
@@ -482,9 +366,85 @@ type Room = {
   boss?: BossState;
   /** Active revive request awaiting host decision */
   pendingRevive?: ReviveRequest;
+  /** Timer handle for the countdown→question transition */
+  countdownTimer?: ReturnType<typeof setTimeout>;
 };
 
 const rooms = new Map<string, Room>();
+
+/**
+ * Reverse lookup: socketId → room code.
+ * Avoids iterating all rooms on every disconnect.
+ */
+const socketToRoomCode = new Map<string, string>();
+
+/** How long a room can be idle before it's cleaned up (ms) */
+const ROOM_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+/** How often to run the cleanup sweep (ms) */
+const ROOM_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+
+/** Update room's last activity timestamp */
+function touchRoom(room: Room) {
+  room.lastActivityAt = Date.now();
+}
+
+/** Remove a room and clean up all related socket mappings */
+function destroyRoom(code: string) {
+  const room = rooms.get(code);
+  if (!room) return;
+
+  // Clear pending countdown timer
+  if (room.countdownTimer) {
+    clearTimeout(room.countdownTimer);
+    room.countdownTimer = undefined;
+  }
+
+  // Clean up reverse lookup for all sockets in this room
+  for (const socketId of room.socketToPlayerId.keys()) {
+    socketToRoomCode.delete(socketId);
+  }
+  if (room.hostSocketId) {
+    socketToRoomCode.delete(room.hostSocketId);
+  }
+
+  rooms.delete(code);
+  logger.info({ code, playerCount: room.playersById.size }, 'room destroyed (cleanup)');
+}
+
+/** Periodic sweep: remove idle/ended rooms */
+function cleanupRooms() {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [code, room] of rooms) {
+    const idle = now - room.lastActivityAt;
+
+    // Remove ended rooms after 10 minutes
+    if (room.phase === 'ended' && idle > 10 * 60 * 1000) {
+      destroyRoom(code);
+      cleaned++;
+      continue;
+    }
+
+    // Remove rooms idle for too long
+    if (idle > ROOM_IDLE_TIMEOUT_MS) {
+      destroyRoom(code);
+      cleaned++;
+      continue;
+    }
+
+    // Remove rooms where everyone disconnected and nobody came back in 15 min
+    const anyoneConnected =
+      room.hostSocketId !== null || Array.from(room.playersById.values()).some((p) => p.connected);
+    if (!anyoneConnected && idle > 15 * 60 * 1000) {
+      destroyRoom(code);
+      cleaned++;
+      continue;
+    }
+  }
+  if (cleaned > 0) {
+    logger.info({ cleaned, remaining: rooms.size }, 'room cleanup sweep');
+  }
+}
 
 /* ────────────────────── Helpers ────────────────────── */
 
@@ -679,6 +639,7 @@ function roomToPublic(room: Room): PublicRoomState {
       q && room.currentQuestion
         ? {
             question: toPublicQuestion(q),
+            countdownEndsAt: room.currentQuestion.countdownEndsAt,
             startedAt: room.currentQuestion.startedAt,
             endsAt: room.currentQuestion.endsAt,
             locked: room.currentQuestion.locked,
@@ -735,6 +696,7 @@ function roomToHost(room: Room): HostRoomState {
 }
 
 function broadcastRoom(io: Server, room: Room) {
+  touchRoom(room);
   io.to(room.code).emit('room:state', roomToPublic(room));
   if (room.hostSocketId) {
     io.to(room.hostSocketId).emit('host:state', roomToHost(room));
@@ -772,32 +734,54 @@ function nextQuestion(room: Room): Question | null {
   return q;
 }
 
-function startQuestion(room: Room, q: Question) {
+function startQuestion(room: Room, q: Question, io: Server) {
   const now = Date.now();
   const durationMs = getQuestionDurationMs(room);
+  const countdownMs = room.config.countdownMs;
+  const countdownEndsAt = now + countdownMs;
 
   // Reset per-question flags
   for (const p of room.playersById.values()) {
     p.lockedIn = false;
   }
 
-  room.phase = room.boss ? 'boss' : 'question';
+  // Clear any existing countdown timer
+  if (room.countdownTimer) {
+    clearTimeout(room.countdownTimer);
+    room.countdownTimer = undefined;
+  }
+
+  // Phase starts as countdown — question timer begins after countdown
+  room.phase = 'countdown';
   room.currentQuestion = {
     questionId: q.id,
-    startedAt: now,
-    endsAt: now + durationMs,
+    countdownEndsAt,
+    startedAt: countdownEndsAt, // timer starts when countdown ends
+    endsAt: countdownEndsAt + durationMs,
     answersByPlayerId: new Map(),
     lockinTimeByPlayerId: new Map(),
     freezeBonus: new Map(),
     locked: false,
     forcedRevealAt: undefined,
   };
+
+  // Auto-transition to question/boss phase when countdown ends
+  room.countdownTimer = setTimeout(() => {
+    room.countdownTimer = undefined;
+    // Guard: only transition if still in countdown for this question
+    if (room.phase !== 'countdown') return;
+    if (room.currentQuestion?.questionId !== q.id) return;
+
+    room.phase = room.boss ? 'boss' : 'question';
+    broadcastRoom(io, room);
+    logger.info(`  ▶ Countdown finished — question live in room ${room.code}`);
+  }, countdownMs);
 }
 
 /** Start a new act: loads its questions and resets act-level state */
 function startAct(room: Room, actId: ActId) {
   const config = ACT_CONFIGS[actId];
-  const questions = shuffle(getActQuestions(actId));
+  const questions = shuffle(getActQuestions(room, actId));
 
   room.actState = {
     actId,
@@ -956,6 +940,14 @@ function isActFinished(room: Room): boolean {
 /* ────────────────────── Main ────────────────────── */
 
 async function main() {
+  // Load question packs before anything else
+  const packCount = loadQuestionPacks();
+  if (packCount === 0) {
+    logger.error(
+      'No question packs loaded — the game will not work. Add .json packs to data/question-packs/'
+    );
+  }
+
   await nextApp.prepare();
   const app = express();
   const httpServer = createServer(app);
@@ -967,6 +959,28 @@ async function main() {
     pingInterval: 25_000,
   });
 
+  // ── Rate limiting middleware ──
+  const RATE_LIMIT_WINDOW_MS = 1_000; // 1 second window
+  const RATE_LIMIT_MAX_EVENTS = 20; // max events per window
+  const socketEventCounts = new Map<string, { count: number; resetAt: number }>();
+
+  io.use((socket, next) => {
+    socket.onAny(() => {
+      const now = Date.now();
+      let entry = socketEventCounts.get(socket.id);
+      if (!entry || now >= entry.resetAt) {
+        entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+        socketEventCounts.set(socket.id, entry);
+      }
+      entry.count++;
+      if (entry.count > RATE_LIMIT_MAX_EVENTS) {
+        logger.warn({ socketId: socket.id }, 'rate limit exceeded — disconnecting');
+        socket.disconnect(true);
+      }
+    });
+    next();
+  });
+
   io.on('connection', (socket) => {
     logger.info({ socketId: socket.id }, 'socket connected');
 
@@ -974,16 +988,26 @@ async function main() {
       logger.info('event', event, 'from', socket.id);
     });
 
+    // Clean up rate limit entry on disconnect
+    socket.on('disconnect', () => {
+      socketEventCounts.delete(socket.id);
+    });
+
     /* ── Room: Create ── */
     socket.on(
       'room:create',
       (
-        payload: { hostName: string },
+        payload: { hostName: string; packId?: string },
         ack: (res: Ack<{ room: PublicRoomState; hostKey: string }>) => void
       ) => {
         try {
           const hostName = (payload?.hostName || '').trim().slice(0, 20);
           if (!hostName) return ack({ ok: false, error: 'Host name is required.' });
+
+          if (!hasAnyPacks()) return ack({ ok: false, error: 'No question packs loaded.' });
+
+          const packId = (payload?.packId || '').trim() || getDefaultPackId();
+          if (!packId) return ack({ ok: false, error: 'No question pack available.' });
 
           let code = makeCode();
           for (let i = 0; i < 10 && rooms.has(code); i++) code = makeCode();
@@ -993,10 +1017,12 @@ async function main() {
           const room: Room = {
             code,
             createdAt: Date.now(),
+            lastActivityAt: Date.now(),
             hostKey,
             hostSocketId: socket.id,
             phase: 'lobby',
             config: { ...DEFAULT_CONFIG },
+            packId,
             playersById: new Map(),
             socketToPlayerId: new Map(),
             actState: null,
@@ -1009,8 +1035,9 @@ async function main() {
           };
 
           rooms.set(code, room);
+          socketToRoomCode.set(socket.id, code);
           socket.join(code);
-          logger.info(`Room ${code} created by host "${hostName}"`);
+          logger.info(`Room ${code} created by host "${hostName}" (pack: ${packId})`);
 
           ack({ ok: true, data: { room: roomToPublic(room), hostKey } });
           broadcastRoom(io, room);
@@ -1035,6 +1062,40 @@ async function main() {
 
           const room = requireRoom(code);
 
+          const existingRoom = socketToRoomCode.get(socket.id);
+          if (existingRoom && existingRoom !== code) {
+            return ack({
+              ok: false,
+              error: 'This tab is already in a different room. Refresh and try again.',
+            });
+          }
+          if (room.socketToPlayerId.has(socket.id)) {
+            return ack({ ok: false, error: 'You are already joined in this room.' });
+          }
+
+          // ── Join guards ──
+          if (room.playersById.size >= MAX_PLAYERS) {
+            return ack({ ok: false, error: `Room is full (max ${MAX_PLAYERS} players).` });
+          }
+
+          if (room.phase !== 'lobby') {
+            return ack({
+              ok: false,
+              error: 'Game already in progress. Ask the host to let you in.',
+            });
+          }
+
+          const nameLower = name.toLowerCase();
+          const nameTaken = Array.from(room.playersById.values()).some(
+            (p) => p.name.toLowerCase() === nameLower
+          );
+          if (nameTaken) {
+            return ack({
+              ok: false,
+              error: `"${name}" is already taken. Choose a different name.`,
+            });
+          }
+
           const playerId = nanoid(12);
           const p: Player = {
             playerId,
@@ -1054,7 +1115,9 @@ async function main() {
 
           room.playersById.set(playerId, p);
           room.socketToPlayerId.set(socket.id, playerId);
+          socketToRoomCode.set(socket.id, code);
           socket.join(code);
+          touchRoom(room);
 
           ack({ ok: true, data: { room: roomToPublic(room), playerId } });
           broadcastRoom(io, room);
@@ -1081,8 +1144,18 @@ async function main() {
 
           if (hostKey) {
             requireHost(room, hostKey);
+
+            const prevHostSocketId = room.hostSocketId;
+            if (prevHostSocketId && prevHostSocketId !== socket.id) {
+              const prev = io.sockets.sockets.get(prevHostSocketId);
+              if (prev) prev.disconnect(true);
+              socketToRoomCode.delete(prevHostSocketId);
+            }
+
             room.hostSocketId = socket.id;
+            socketToRoomCode.set(socket.id, code);
             socket.join(code);
+            touchRoom(room);
             ack({ ok: true, data: { room: roomToPublic(room), isHost: true } });
             broadcastRoom(io, room);
             return;
@@ -1091,10 +1164,22 @@ async function main() {
           if (!playerId) return ack({ ok: false, error: 'playerId is required.' });
 
           const p = requirePlayer(room, playerId);
+
+          const prevSocketId = p.socketId;
+          if (prevSocketId && prevSocketId !== socket.id) {
+            // Prevent duplicate player sessions (two tabs) — kick the older socket
+            room.socketToPlayerId.delete(prevSocketId);
+            socketToRoomCode.delete(prevSocketId);
+            const prev = io.sockets.sockets.get(prevSocketId);
+            if (prev) prev.disconnect(true);
+          }
+
           p.socketId = socket.id;
           p.connected = true;
           room.socketToPlayerId.set(socket.id, playerId);
+          socketToRoomCode.set(socket.id, code);
           socket.join(code);
+          touchRoom(room);
 
           ack({ ok: true, data: { room: roomToPublic(room), isHost: false } });
           broadcastRoom(io, room);
@@ -1131,9 +1216,10 @@ async function main() {
         if (p) p.connected = false;
       }
       room.socketToPlayerId.delete(socket.id);
+      socketToRoomCode.delete(socket.id);
       socket.leave(code);
-      broadcastRoom(io, room);
       maybeEnd(room);
+      broadcastRoom(io, room);
     });
 
     /* ── Game: Configure ── */
@@ -1198,7 +1284,7 @@ async function main() {
           // Auto-start the first question
           const q = nextQuestion(room);
           if (!q) throw new Error('No questions available for this act.');
-          startQuestion(room, q);
+          startQuestion(room, q, io);
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -1229,7 +1315,37 @@ async function main() {
 
           const q = nextQuestion(room);
           if (!q) throw new Error('No questions available.');
-          startQuestion(room, q);
+          startQuestion(room, q, io);
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Game: End (host force-ends and shows results) ── */
+    socket.on(
+      'game:end',
+      (
+        payload: { code: string; hostKey: string },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          requireHost(room, (payload?.hostKey || '').trim());
+
+          // Stop any pending countdown→question transition
+          if (room.countdownTimer) {
+            clearTimeout(room.countdownTimer);
+            room.countdownTimer = undefined;
+          }
+
+          room.shopOpen = false;
+          room.currentQuestion = undefined;
+          room.phase = 'ended';
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -1301,21 +1417,29 @@ async function main() {
 
           const q = nextQuestion(room);
           if (!q) {
-            // Act is finished — go to intermission so host can open shop or start next act
+            // Act finished. If this was the final act, end the game; otherwise go to intermission.
             if (room.actState) {
-              room.phase = 'intermission';
-              logger.info(`  🏁 Act "${room.actState.config.name}" finished in room ${room.code}`);
+              const currentIdx = ACT_ORDER.indexOf(room.actState.actId);
+              const isFinalAct = currentIdx === ACT_ORDER.length - 1;
+
+              room.phase = isFinalAct ? 'ended' : 'intermission';
+
+              logger.info(
+                `  🏁 ${isFinalAct ? 'Final act' : 'Act'} "${room.actState.config.name}" finished in room ${room.code}`
+              );
+
               ack({ ok: true, data: { room: roomToPublic(room) } });
               broadcastRoom(io, room);
               return;
             }
+
             room.phase = 'ended';
             ack({ ok: true, data: { room: roomToPublic(room) } });
             broadcastRoom(io, room);
             return;
           }
 
-          startQuestion(room, q);
+          startQuestion(room, q, io);
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
         } catch (e) {
@@ -1611,7 +1735,7 @@ async function main() {
 
           const q = nextQuestion(room);
           if (!q) throw new Error('No boss questions available.');
-          startQuestion(room, q);
+          startQuestion(room, q, io);
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -1740,21 +1864,28 @@ async function main() {
 
     /* ── Disconnect ── */
     socket.on('disconnect', () => {
-      for (const room of rooms.values()) {
-        if (room.hostSocketId === socket.id) {
-          room.hostSocketId = null;
-          logger.info(`Host disconnected from room ${room.code}`);
-        }
+      const code = socketToRoomCode.get(socket.id);
+      socketToRoomCode.delete(socket.id);
 
-        const playerId = room.socketToPlayerId.get(socket.id);
-        if (!playerId) continue;
+      if (!code) return;
+      const room = rooms.get(code);
+      if (!room) return;
+
+      if (room.hostSocketId === socket.id) {
+        room.hostSocketId = null;
+        logger.info(`Host disconnected from room ${room.code}`);
+      }
+
+      const playerId = room.socketToPlayerId.get(socket.id);
+      if (playerId) {
         room.socketToPlayerId.delete(socket.id);
         const p = room.playersById.get(playerId);
         if (p) p.connected = false;
-        maybeForceCloseIfAllLocked(room);
-        broadcastRoom(io, room);
-        maybeEnd(room);
       }
+
+      maybeForceCloseIfAllLocked(room);
+      maybeEnd(room);
+      broadcastRoom(io, room);
     });
   });
 
@@ -1763,7 +1894,41 @@ async function main() {
     res.json({ ip, port, url: ip ? `http://${ip}:${port}` : null });
   });
 
+  // Question pack endpoints
+  app.get('/api/packs', (_req, res) => {
+    res.json({ packs: listPacks() });
+  });
+
+  // Hot-reload packs (dev only) — drop a new JSON and hit this
+  if (dev) {
+    app.post('/api/packs/reload', (_req, res) => {
+      const count = loadQuestionPacks();
+      res.json({ reloaded: count, packs: listPacks() });
+    });
+  }
+
+  // Debug endpoint: room stats (dev only)
+  if (dev) {
+    app.get('/api/debug/rooms', (_req, res) => {
+      const summary = Array.from(rooms.values()).map((r) => ({
+        code: r.code,
+        phase: r.phase,
+        players: r.playersById.size,
+        connected: Array.from(r.playersById.values()).filter((p) => p.connected).length,
+        idleMs: Date.now() - r.lastActivityAt,
+        act: r.actState?.actId ?? null,
+      }));
+      res.json({ roomCount: rooms.size, socketMappings: socketToRoomCode.size, rooms: summary });
+    });
+  }
+
   app.use((req, res) => handle(req, res));
+
+  // Start periodic room cleanup
+  setInterval(cleanupRooms, ROOM_CLEANUP_INTERVAL_MS);
+  logger.info(
+    `Room cleanup: every ${ROOM_CLEANUP_INTERVAL_MS / 1000}s, idle timeout ${ROOM_IDLE_TIMEOUT_MS / 1000}s`
+  );
 
   httpServer.listen(port, '0.0.0.0', () => {
     const ip = getLanIPv4();

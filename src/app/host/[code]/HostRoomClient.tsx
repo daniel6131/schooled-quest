@@ -143,6 +143,11 @@ export default function HostRoomClient({ code }: { code: string }) {
   const canReveal =
     !!q && (phase === 'question' || phase === 'boss') && !q.locked && now >= revealAt;
 
+  const isCountdown = phase === 'countdown';
+  const countdownEndsAt = q?.countdownEndsAt ?? 0;
+  const countdownMsLeft = isCountdown ? Math.max(0, countdownEndsAt - now) : 0;
+  const countdownSecondsLeft = Math.ceil(countdownMsLeft / 1000);
+
   const isIntermission = phase === 'intermission';
 
   const pendingRevive = hostState?.pendingRevive ?? null;
@@ -285,7 +290,6 @@ export default function HostRoomClient({ code }: { code: string }) {
             >
               {phase === 'lobby' ? '▶ Start Game' : '⏭ Next Question'}
             </button>
-
             {/* Reveal */}
             <button
               className="rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-amber-600 disabled:opacity-40"
@@ -295,7 +299,6 @@ export default function HostRoomClient({ code }: { code: string }) {
             >
               👁 Reveal Answer
             </button>
-
             {/* Shop */}
             <button
               className="rounded-xl bg-purple-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-purple-700 disabled:opacity-40"
@@ -307,7 +310,6 @@ export default function HostRoomClient({ code }: { code: string }) {
             >
               🛒 {shopOpen ? 'Close Shop' : 'Open Shop'}
             </button>
-
             {/* Boss (only available as an act transition from intermission) */}
             <button
               className="rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-40"
@@ -317,6 +319,15 @@ export default function HostRoomClient({ code }: { code: string }) {
             >
               🐉 Start Boss
             </button>
+            {/* End Game */}
+            <button
+              className="rounded-xl bg-neutral-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-neutral-900 disabled:opacity-40"
+              disabled={phase === 'ended'}
+              onClick={() => emitHost('game:end', {}, 'End Game')}
+              type="button"
+            >
+              🏁 End Game
+            </button>{' '}
           </div>
 
           {/* ── Act Transitions (during intermission) ── */}
@@ -369,13 +380,22 @@ export default function HostRoomClient({ code }: { code: string }) {
               </span>
             )}
 
-            {/* Timer */}
-            <div className="mt-3 flex items-center justify-between rounded-xl border bg-white px-3 py-2 text-sm">
-              <span className="font-semibold">⏱️ Reveal in</span>
-              <span className="font-bold tabular-nums">
-                {q.locked ? '—' : `${Math.max(0, Math.ceil((revealAt - now) / 1000))}s`}
-              </span>
-            </div>
+            {/* Timer / Countdown */}
+            {isCountdown ? (
+              <div className="mt-3 flex items-center justify-center gap-3 rounded-xl border bg-blue-50 px-3 py-4">
+                <span className="text-3xl font-black text-blue-600 tabular-nums">
+                  {countdownSecondsLeft}
+                </span>
+                <span className="text-sm font-semibold text-blue-700">Countdown…</span>
+              </div>
+            ) : (
+              <div className="mt-3 flex items-center justify-between rounded-xl border bg-white px-3 py-2 text-sm">
+                <span className="font-semibold">⏱️ Reveal in</span>
+                <span className="font-bold tabular-nums">
+                  {q.locked ? '—' : `${Math.max(0, Math.ceil((revealAt - now) / 1000))}s`}
+                </span>
+              </div>
+            )}
 
             <p className="mt-2 text-xs font-semibold text-neutral-700">
               🔒 Locked in:{' '}
@@ -422,6 +442,58 @@ export default function HostRoomClient({ code }: { code: string }) {
             </div>
           </section>
         )}
+
+        {/* ── Final Results ── */}
+        {phase === 'ended' &&
+          (room?.players.length ?? 0) > 0 &&
+          (() => {
+            const sorted = [...(room?.players ?? [])].sort((a, b) => b.score - a.score);
+            const podium = sorted.slice(0, 3);
+            const medals = ['🥇', '🥈', '🥉'];
+
+            return (
+              <section className="rounded-2xl border-2 border-amber-300 bg-linear-to-b from-amber-50 to-white p-6">
+                <h2 className="text-center text-2xl font-bold">🏆 Game Over!</h2>
+
+                <div className="mt-5 flex items-end justify-center gap-3">
+                  {podium.map((p, i) => (
+                    <div
+                      key={p.playerId}
+                      className={`flex flex-col items-center rounded-xl border p-3 ${
+                        i === 0
+                          ? 'order-2 min-w-28 border-amber-300 bg-amber-50'
+                          : i === 1
+                            ? 'order-1 min-w-24 border-neutral-300 bg-neutral-50'
+                            : 'order-3 min-w-24 border-orange-200 bg-orange-50'
+                      }`}
+                    >
+                      <span className="text-2xl">{medals[i]}</span>
+                      <span className="mt-1 text-sm font-bold">{p.name}</span>
+                      <span className="mt-0.5 text-lg font-black tabular-nums">{p.score}</span>
+                      <span className="text-xs text-neutral-500">points</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Full rankings */}
+                <div className="mt-4 space-y-1.5">
+                  {sorted.map((p, rank) => (
+                    <div
+                      key={p.playerId}
+                      className="flex items-center justify-between rounded-lg border px-3 py-2 text-sm"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="w-5 font-bold text-neutral-400">{rank + 1}.</span>
+                        <span className="font-medium">{p.name}</span>
+                        {p.eliminated && <span className="text-xs text-red-500">💀</span>}
+                      </div>
+                      <span className="font-bold tabular-nums">{p.score}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            );
+          })()}
 
         {/* ── Players ── */}
         <section className="rounded-2xl border p-5">
