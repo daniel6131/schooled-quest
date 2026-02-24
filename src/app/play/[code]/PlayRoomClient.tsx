@@ -38,6 +38,9 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const [now, setNow] = useState(() => Date.now());
   const [revealFeedback, setRevealFeedback] = useState<PlayerRevealPayload | null>(null);
 
+  /** Frozen speed bonus preview at the moment the player locked in */
+  const [lockedInBonusPreview, setLockedInBonusPreview] = useState<number | null>(null);
+
   const [playerId, setPlayerId] = useState<string | null>(null);
   const localStorageChecked = useRef(false);
   const joinAttemptedRef = useRef(false);
@@ -120,6 +123,7 @@ export default function PlayRoomClient({ code }: { code: string }) {
           setRemovedIndexes(null);
           setFreezeBonusMs(0);
           setRevealFeedback(null);
+          setLockedInBonusPreview(null);
         }
         return nextRoom;
       });
@@ -227,13 +231,28 @@ export default function PlayRoomClient({ code }: { code: string }) {
 
   const lockIn = useCallback(() => {
     if (!playerId) return;
+
+    // Snapshot the potential bonus at lock-in time
+    const lockTime = Date.now();
+
     emit<{ room: PublicRoomState }>('player:lockin', { code: roomCode, playerId }, (ack) => {
       if (!ack.ok) {
         setError(ack.error);
         addLog(`❌ Lock in: ${ack.error}`);
       } else {
         setError(null);
-        setRoom(ack.data.room);
+        setRoom((prev) => {
+          // Compute preview from what we know client-side
+          const sbMax = prev?.currentAct?.speedBonusMax ?? 0;
+          const startedAt = prev?.currentQuestion?.startedAt ?? lockTime;
+          const baseDurationMs = (prev?.currentQuestion?.endsAt ?? lockTime) - startedAt;
+          if (sbMax > 0 && baseDurationMs > 0) {
+            const elapsed = lockTime - startedAt;
+            const frac = Math.max(0, 1 - elapsed / baseDurationMs);
+            setLockedInBonusPreview(Math.floor(sbMax * frac));
+          }
+          return ack.data.room;
+        });
         addLog('🔒 Locked in!');
       }
     });
@@ -341,6 +360,16 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const isBossAct = currentAct?.id === 'boss_fight';
   const canRequestRevive =
     !!me?.eliminated && !isQuestionPhase && !isBossAct && reviveStatus === 'idle';
+
+  // ── Speed Bonus Preview (live countdown, client-only) ──
+  const speedBonusMax = currentAct?.speedBonusMax ?? 0;
+  const baseDurationMs = q ? q.endsAt - q.startedAt : 0;
+  const liveSpeedBonus =
+    q && isQuestionPhase && !q.locked && speedBonusMax > 0 && baseDurationMs > 0
+      ? Math.max(0, Math.floor(speedBonusMax * (1 - (now - q.startedAt) / baseDurationMs)))
+      : 0;
+  // Show frozen value if locked in, otherwise live value
+  const displaySpeedBonus = me?.lockedIn ? (lockedInBonusPreview ?? 0) : liveSpeedBonus;
 
   if (!roomCode) {
     return (
@@ -530,6 +559,28 @@ export default function PlayRoomClient({ code }: { code: string }) {
                   style={{ width: `${Math.round(remainingFrac * 100)}%` }}
                 />
               </div>
+
+              {/* Speed Bonus Preview */}
+              {speedBonusMax > 0 && isQuestionPhase && !q.locked && !me?.eliminated && (
+                <div className="mt-2 flex items-center justify-between">
+                  <span className="text-xs font-medium text-amber-700">⚡ Speed Bonus</span>
+                  <span
+                    className={`text-sm font-bold tabular-nums ${
+                      me?.lockedIn
+                        ? 'text-green-600'
+                        : displaySpeedBonus > 0
+                          ? 'text-amber-600'
+                          : 'text-neutral-400'
+                    }`}
+                  >
+                    {me?.lockedIn
+                      ? `🔒 +${displaySpeedBonus}`
+                      : timeUp
+                        ? '+0'
+                        : `+${displaySpeedBonus}`}
+                  </span>
+                </div>
+              )}
             </div>
 
             <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
@@ -550,6 +601,9 @@ export default function PlayRoomClient({ code }: { code: string }) {
                   : revealFeedback.yourAnswerIndex === null
                     ? '⏱️ No answer submitted'
                     : '❌ Wrong'}
+                {revealFeedback.correct && revealFeedback.speedBonus
+                  ? ` (⚡ +${revealFeedback.speedBonus} speed bonus)`
+                  : null}
                 {!revealFeedback.heartsAtRisk &&
                   !revealFeedback.correct &&
                   revealFeedback.yourAnswerIndex !== null && (

@@ -27,6 +27,8 @@ export type ActConfig = {
   scoreMultiplier: number;
   /** Which shop items are available for purchase during this act's shop windows */
   availableShopItems: ShopItemId[];
+  /** Max speed bonus points for an instant lock-in (scales linearly with time remaining) */
+  speedBonusMax: number;
 };
 
 export type Player = {
@@ -136,6 +138,7 @@ export type PublicRoomState = {
     heartsAtRisk: boolean;
     questionNumber: number;
     totalQuestions: number;
+    speedBonusMax: number;
   };
 };
 
@@ -181,6 +184,8 @@ export type PlayerRevealPayload = {
   buybackUsed?: boolean;
   /** Whether hearts were at risk for this question */
   heartsAtRisk?: boolean;
+  /** Speed bonus points earned (0 if not locked in or wrong) */
+  speedBonus?: number;
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };

@@ -23,6 +23,8 @@ type ActConfig = {
   scoreMultiplier: number;
   /** Which shop items are available for purchase during this act's shop windows */
   availableShopItems: ShopItemId[];
+  /** Max speed bonus points for an instant lock-in (scales linearly with time remaining) */
+  speedBonusMax: number;
 };
 
 type Player = {
@@ -76,6 +78,8 @@ type CurrentQuestion = {
   startedAt: number;
   endsAt: number;
   answersByPlayerId: Map<string, number>;
+  /** Timestamp when each player locked in (used for speed bonus calculation) */
+  lockinTimeByPlayerId: Map<string, number>;
   freezeBonus: Map<string, number>;
   locked: boolean;
   forcedRevealAt?: number;
@@ -132,6 +136,7 @@ type PublicRoomState = {
     heartsAtRisk: boolean;
     questionNumber: number;
     totalQuestions: number;
+    speedBonusMax: number;
   };
 };
 
@@ -168,6 +173,8 @@ type PlayerRevealPayload = {
   doublePointsUsed?: boolean;
   buybackUsed?: boolean;
   heartsAtRisk?: boolean;
+  /** Speed bonus points earned (0 if not locked in or wrong) */
+  speedBonus?: number;
 };
 
 type ItemUseAckData =
@@ -184,7 +191,7 @@ const handle = nextApp.getRequestHandler();
 const makeCode = customAlphabet('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 5);
 
 const DEFAULT_CONFIG: RoomConfig = {
-  maxLives: 1,
+  maxLives: 3,
   questionDurationMs: 25_000, // fallback, acts override this
   startingCoins: 150,
   buybackCostCoins: 200,
@@ -206,6 +213,7 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
     scoreMultiplier: 1.0,
     // Act 1: only basic active items — let players learn the ropes
     availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points'],
+    speedBonusMax: 20, // small bonus — warm-up, keep it chill
   },
   pop_quiz: {
     id: 'pop_quiz',
@@ -219,6 +227,7 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
     scoreMultiplier: 1.0,
     // Act 2: introduce Shield + Buyback now that hearts can be lost on hard Qs
     availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+    speedBonusMax: 30,
   },
   field_trip: {
     id: 'field_trip',
@@ -232,6 +241,7 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
     scoreMultiplier: 1.5,
     // Act 3: everything available
     availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+    speedBonusMax: 40,
   },
   boss_fight: {
     id: 'boss_fight',
@@ -245,6 +255,7 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
     scoreMultiplier: 2.0,
     // Act 4: everything available
     availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
+    speedBonusMax: 60, // big reward for fast answers in the finale
   },
 };
 
@@ -276,30 +287,30 @@ function getActQuestions(actId: ActId): Question[] {
           answerIndex: 1,
           value: 100,
         },
-        // {
-        //   id: 'hr3',
-        //   category: 'Internet',
-        //   prompt: "What does 'DM' commonly stand for?",
-        //   choices: ['Direct Message', 'Data Mode', 'Dynamic Module', 'Dual Monitor'],
-        //   answerIndex: 0,
-        //   value: 100,
-        // },
-        // {
-        //   id: 'hr4',
-        //   category: 'General',
-        //   prompt: 'Which of these is NOT a database?',
-        //   choices: ['PostgreSQL', 'MongoDB', 'Redis', 'TailwindCSS'],
-        //   answerIndex: 3,
-        //   value: 150,
-        // },
-        // {
-        //   id: 'hr5',
-        //   category: 'Gaming',
-        //   prompt: 'Which company makes the PlayStation?',
-        //   choices: ['Nintendo', 'Sony', 'Microsoft', 'Valve'],
-        //   answerIndex: 1,
-        //   value: 100,
-        // },
+        {
+          id: 'hr3',
+          category: 'Internet',
+          prompt: "What does 'DM' commonly stand for?",
+          choices: ['Direct Message', 'Data Mode', 'Dynamic Module', 'Dual Monitor'],
+          answerIndex: 0,
+          value: 100,
+        },
+        {
+          id: 'hr4',
+          category: 'General',
+          prompt: 'Which of these is NOT a database?',
+          choices: ['PostgreSQL', 'MongoDB', 'Redis', 'TailwindCSS'],
+          answerIndex: 3,
+          value: 150,
+        },
+        {
+          id: 'hr5',
+          category: 'Gaming',
+          prompt: 'Which company makes the PlayStation?',
+          choices: ['Nintendo', 'Sony', 'Microsoft', 'Valve'],
+          answerIndex: 1,
+          value: 100,
+        },
       ];
 
     case 'pop_quiz':
@@ -311,7 +322,6 @@ function getActQuestions(actId: ActId): Question[] {
           choices: ['Go', 'Gd', 'Au', 'Ag'],
           answerIndex: 2,
           value: 150,
-          hard: true,
         },
         {
           id: 'pq2',
@@ -320,26 +330,25 @@ function getActQuestions(actId: ActId): Question[] {
           choices: ['Sydney', 'Melbourne', 'Canberra', 'Perth'],
           answerIndex: 2,
           value: 150,
+        },
+        {
+          id: 'pq3',
+          category: 'Music',
+          prompt: "Which artist released the album 'Blonde'?",
+          choices: ['Tyler, The Creator', 'Kanye West', 'Frank Ocean', 'Childish Gambino'],
+          answerIndex: 2,
+          value: 200,
           hard: true,
         },
-        // {
-        //   id: 'pq3',
-        //   category: 'Music',
-        //   prompt: "Which artist released the album 'Blonde'?",
-        //   choices: ['Tyler, The Creator', 'Kanye West', 'Frank Ocean', 'Childish Gambino'],
-        //   answerIndex: 2,
-        //   value: 200,
-        //   hard: true,
-        // },
-        // {
-        //   id: 'pq4',
-        //   category: 'History',
-        //   prompt: 'In which year did the Berlin Wall fall?',
-        //   choices: ['1987', '1989', '1991', '1993'],
-        //   answerIndex: 1,
-        //   value: 200,
-        //   hard: true,
-        // },
+        {
+          id: 'pq4',
+          category: 'History',
+          prompt: 'In which year did the Berlin Wall fall?',
+          choices: ['1987', '1989', '1991', '1993'],
+          answerIndex: 1,
+          value: 200,
+          hard: true,
+        },
       ];
 
     case 'field_trip':
@@ -360,14 +369,14 @@ function getActQuestions(actId: ActId): Question[] {
           answerIndex: 2,
           value: 250,
         },
-        // {
-        //   id: 'ft3',
-        //   category: 'Movies',
-        //   prompt: "Who directed 'Inception'?",
-        //   choices: ['Steven Spielberg', 'Christopher Nolan', 'Denis Villeneuve', 'James Cameron'],
-        //   answerIndex: 1,
-        //   value: 200,
-        // },
+        {
+          id: 'ft3',
+          category: 'Movies',
+          prompt: "Who directed 'Inception'?",
+          choices: ['Steven Spielberg', 'Christopher Nolan', 'Denis Villeneuve', 'James Cameron'],
+          answerIndex: 1,
+          value: 200,
+        },
       ];
 
     case 'boss_fight':
@@ -388,14 +397,14 @@ function getActQuestions(actId: ActId): Question[] {
           answerIndex: 1,
           value: 350,
         },
-        // {
-        //   id: 'bf3',
-        //   category: 'Boss',
-        //   prompt: 'In chess, which piece can only move diagonally?',
-        //   choices: ['Rook', 'Knight', 'Bishop', 'Queen'],
-        //   answerIndex: 2,
-        //   value: 400,
-        // },
+        {
+          id: 'bf3',
+          category: 'Boss',
+          prompt: 'In chess, which piece can only move diagonally?',
+          choices: ['Rook', 'Knight', 'Bishop', 'Queen'],
+          answerIndex: 2,
+          value: 400,
+        },
       ];
 
     default:
@@ -656,6 +665,7 @@ function roomToPublic(room: Room): PublicRoomState {
         heartsAtRisk: room.actState.config.heartsAtRisk || room.actState.config.heartsOnlyOnHard,
         questionNumber: room.actState.questionIndex,
         totalQuestions: room.actState.questions.length,
+        speedBonusMax: room.actState.config.speedBonusMax,
       }
     : undefined;
 
@@ -777,6 +787,7 @@ function startQuestion(room: Room, q: Question) {
     startedAt: now,
     endsAt: now + durationMs,
     answersByPlayerId: new Map(),
+    lockinTimeByPlayerId: new Map(),
     freezeBonus: new Map(),
     locked: false,
     forcedRevealAt: undefined,
@@ -823,6 +834,8 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
   const actConfig = room.actState?.config;
   const scoreMultiplier = actConfig?.scoreMultiplier ?? 1.0;
   const coinRewardBase = actConfig?.coinRewardBase ?? Math.floor(q.value / 2);
+  const speedBonusMax = actConfig?.speedBonusMax ?? 0;
+  const questionDurationMs = actConfig?.questionDurationMs ?? room.config.questionDurationMs;
 
   const results = new Map<string, PlayerRevealPayload>();
 
@@ -839,9 +852,18 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
     let shieldUsed = false;
     let doublePointsUsed = false;
     let buybackUsed = false;
+    let speedBonus = 0;
 
     if (!wasEliminated) {
       if (correct) {
+        // ── Speed Bonus (only if locked in) ──
+        const lockinTime = room.currentQuestion.lockinTimeByPlayerId.get(p.playerId);
+        if (lockinTime && speedBonusMax > 0) {
+          const elapsed = lockinTime - room.currentQuestion.startedAt;
+          const fractionRemaining = Math.max(0, 1 - elapsed / questionDurationMs);
+          speedBonus = Math.floor(speedBonusMax * fractionRemaining);
+        }
+
         // ── Double Points (passive auto-trigger) ──
         let multiplier = 1;
         if (p.buffs.doublePoints) {
@@ -853,7 +875,7 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
           logger.info(`  🌟 ${p.name}: double points consumed`);
         }
 
-        const scoreDelta = Math.floor(q.value * scoreMultiplier * multiplier);
+        const scoreDelta = Math.floor(q.value * scoreMultiplier * multiplier) + speedBonus;
         p.score += scoreDelta;
         p.coins += coinRewardBase;
 
@@ -907,6 +929,7 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
       doublePointsUsed: doublePointsUsed || undefined,
       buybackUsed: buybackUsed || undefined,
       heartsAtRisk,
+      speedBonus: speedBonus || undefined,
     });
   }
 
@@ -1523,6 +1546,7 @@ async function main() {
           if (typeof ans !== 'number') throw new Error('Pick an answer before locking in.');
 
           p.lockedIn = true;
+          room.currentQuestion.lockinTimeByPlayerId.set(p.playerId, Date.now());
           logger.info(`  🔒 ${p.name} locked in (${room.code})`);
 
           maybeForceCloseIfAllLocked(room);
