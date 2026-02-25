@@ -1,0 +1,264 @@
+{
+  "id": "default",
+  "name": "General Knowledge",
+  "description": "A mix of pop culture, science, history, and internet trivia.",
+  "version": 1,
+  "author": "Schooled",
+  "questions": {
+    "homeroom": [
+      {
+        "id": "hr01",
+        "category": "Tech",
+        "prompt": "Which language is used to style web pages?",
+        "choices": ["HTML", "CSS", "TypeScript", "Node.js"],
+        "answerIndex": 1,
+        "value": 100
+      },
+      {
+        "id": "hr02",
+        "category": "Gaming",
+        "prompt": "In Rocket League, what do you hit into the goal?",
+        "choices": ["Puck", "Ball", "Disc", "Cube"],
+        "answerIndex": 1,
+        "value": 100
+      }
+    ],
+    "pop_quiz": [
+      {
+        "id": "pq01",
+        "category": "Science",
+        "prompt": "What is the chemical symbol for gold?",
+        "choices": ["Go", "Gd", "Au", "Ag"],
+        "answerIndex": 2,
+        "value": 150
+      },
+      {
+        "id": "pq02",
+        "category": "Geography",
+        "prompt": "What is the capital of Australia?",
+        "choices": ["Sydney", "Melbourne", "Canberra", "Perth"],
+        "answerIndex": 2,
+        "value": 150
+      },
+      {
+        "id": "pq03",
+        "category": "Music",
+        "prompt": "Which artist released the album 'Blonde'?",
+        "choices": ["Tyler, The Creator", "Kanye West", "Frank Ocean", "Childish Gambino"],
+        "answerIndex": 2,
+        "value": 200,
+        "hard": true
+      },
+      {
+        "id": "pq04",
+        "category": "History",
+        "prompt": "In which year did the Berlin Wall fall?",
+        "choices": ["1987", "1989", "1991", "1993"],
+        "answerIndex": 1,
+        "value": 200,
+        "hard": true
+      },
+      {
+        "id": "pq05",
+        "category": "Science",
+        "prompt": "What planet is known as the Red Planet?",
+        "choices": ["Venus", "Mars", "Jupiter", "Saturn"],
+        "answerIndex": 1,
+        "value": 150
+      },
+      {
+        "id": "pq06",
+        "category": "Movies",
+        "prompt": "Which film franchise features a character called Groot?",
+        "choices": ["Star Wars", "Guardians of the Galaxy", "Avatar", "The Matrix"],
+        "answerIndex": 1,
+        "value": 150
+      },
+      {
+        "id": "pq07",
+        "category": "Math",
+        "prompt": "What is the square root of 144?",
+        "choices": ["10", "11", "12", "14"],
+        "answerIndex": 2,
+        "value": 200,
+        "hard": true
+      }
+    ],
+    "field_trip": [
+      {
+        "id": "ft01",
+        "category": "Science",
+        "prompt": "How many bones are in the adult human body?",
+        "choices": ["186", "196", "206", "216"],
+        "answerIndex": 2,
+        "value": 200
+      },
+      {
+        "id": "ft02",
+        "category": "Geography",
+        "prompt": "Which country has the most time zones?",
+        "choices": ["Russia", "USA", "France", "China"],
+        "answerIndex": 2,
+        "value": 250
+      },
+      {
+        "id": "ft03",
+        "category": "Movies",
+        "prompt": "Who directed 'Inception'?",
+        "choices": ["Steven Spielberg", "Christopher Nolan", "Denis Villeneuve", "James Cameron"],
+        "answerIndex": 1,
+        "value": 200
+      },
+      {
+        "id": "ft04",
+        "category": "History",
+        "prompt": "Which ancient wonder was located in Alexandria?",
+        "choices": ["Colossus", "Hanging Gardens", "Lighthouse", "Temple of Artemis"],
+        "answerIndex": 2,
+        "value": 250
+      },
+      {
+        "id": "ft05",
+        "category": "Science",
+        "prompt": "What is the hardest natural substance on Earth?",
+        "choices": ["Titanium", "Quartz", "Diamond", "Graphene"],
+        "answerIndex": 2,
+        "value": 200
+      },
+      {
+        "id": "ft06",
+        "category": "Music",
+        "prompt": "Which classical composer was deaf when he wrote his 9th Symphony?",
+        "choices": ["Mozart", "Bach", "Beethoven", "Chopin"],
+        "answerIndex": 2,
+        "value": 250
+      }
+    ],
+    "wager_round": [
+      {
+        "id": "wr01",
+        "category": "Logic",
+        "hint": "Only ONE option can be true \u2014 but more than one can sound right.",
+        "prompt": "A jar has 3 red, 2 blue, and 1 green marble. You draw 2 marbles without replacement. Which outcome is MOST likely?",
+        "choices": ["Two red", "One red and one blue", "Two blue", "One green and one red"],
+        "answerIndex": 1,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Count combinations: total pairs = C(6,2). Compare how many pairs match each option."
+      },
+      {
+        "id": "wr02",
+        "category": "Math",
+        "hint": "Think about what changes (and what doesn\u2019t) when you add the same number twice.",
+        "prompt": "If x is an integer and 2x + 1 is even, which must be true?",
+        "choices": ["x is even", "x is odd", "x is prime", "No such integer x exists"],
+        "answerIndex": 3,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Parity check: 2x is always even, so 2x+1 is always odd."
+      },
+      {
+        "id": "wr03",
+        "category": "Science",
+        "hint": "One option is a common misconception.",
+        "prompt": "Which statement about seasons on Earth is correct?",
+        "choices": [
+          "Seasons happen because Earth is closer to the Sun in summer",
+          "Seasons happen mainly because of Earth\u2019s tilt",
+          "Seasons happen because the Sun\u2019s heat output changes each month",
+          "Seasons only happen in the Northern Hemisphere"
+        ],
+        "answerIndex": 1,
+        "value": 250,
+        "extraHint": "Seasons come from the angle of sunlight and day length changes over the year."
+      },
+      {
+        "id": "wr04",
+        "category": "Probability",
+        "hint": "Independence matters here.",
+        "prompt": "You flip a fair coin 4 times. What is the probability of getting exactly 2 heads?",
+        "choices": ["1/4", "3/8", "1/2", "5/8"],
+        "answerIndex": 1,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Use the binomial count: C(4,2) ways to place 2 heads, each sequence has probability (1/2)^4."
+      },
+      {
+        "id": "wr05",
+        "category": "Words",
+        "hint": "Read carefully: it\u2019s about what MUST be true, not what is likely.",
+        "prompt": "If all Blips are Blops, and some Blops are Blaps, which must be true?",
+        "choices": [
+          "Some Blips are Blaps",
+          "All Blops are Blips",
+          "Some Blaps are Blops",
+          "No Blips are Blaps"
+        ],
+        "answerIndex": 2,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Translate carefully: \u201csome Blops are Blaps\u201d means at least one Blap is also a Blop."
+      },
+      {
+        "id": "wr06",
+        "category": "Tech",
+        "hint": "Two of these look similar, but only one is truly a protocol.",
+        "prompt": "Which of these is a network protocol (not a programming language or platform)?",
+        "choices": ["Python", "HTTP", "React", "Node.js"],
+        "answerIndex": 1,
+        "value": 250,
+        "extraHint": "A protocol is a set of communication rules (often like HTTP/FTP), not a language/framework/runtime."
+      }
+    ],
+    "boss_fight": [
+      {
+        "id": "bf01",
+        "category": "Tech",
+        "prompt": "What year was the first iPhone released?",
+        "choices": ["2005", "2006", "2007", "2008"],
+        "answerIndex": 2,
+        "value": 300
+      },
+      {
+        "id": "bf02",
+        "category": "Science",
+        "prompt": "Which element has the atomic number 1?",
+        "choices": ["Helium", "Hydrogen", "Lithium", "Carbon"],
+        "answerIndex": 1,
+        "value": 350
+      },
+      {
+        "id": "bf03",
+        "category": "Strategy",
+        "prompt": "In chess, which piece can only move diagonally?",
+        "choices": ["Rook", "Knight", "Bishop", "Queen"],
+        "answerIndex": 2,
+        "value": 400
+      },
+      {
+        "id": "bf04",
+        "category": "Geography",
+        "prompt": "What is the smallest country in the world by area?",
+        "choices": ["Monaco", "Vatican City", "San Marino", "Liechtenstein"],
+        "answerIndex": 1,
+        "value": 350
+      },
+      {
+        "id": "bf05",
+        "category": "Science",
+        "prompt": "What is the speed of light in km/s (approximately)?",
+        "choices": ["150,000", "200,000", "300,000", "400,000"],
+        "answerIndex": 2,
+        "value": 400
+      },
+      {
+        "id": "bf06",
+        "category": "History",
+        "prompt": "Which empire built Machu Picchu?",
+        "choices": ["Aztec", "Maya", "Inca", "Olmec"],
+        "answerIndex": 2,
+        "value": 350
+      }
+    ]
+  }
+}

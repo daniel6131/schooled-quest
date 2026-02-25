@@ -1,7 +1,16 @@
 'use client';
 
+import { logger } from '@/lib/logger';
 import { getSocket } from '@/lib/socket';
-import type { Ack, PublicRoomState, ShopItemId } from '@/lib/types';
+import type {
+  Ack,
+  PlayerRevealPayload,
+  PublicRoomState,
+  ShopItemId,
+  WagerSpotlightPayload,
+  WagerStage,
+  WagerTier,
+} from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -33,12 +42,26 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const [log, setLog] = useState<string[]>([]);
   const [removedIndexes, setRemovedIndexes] = useState<number[] | null>(null);
   const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
-  const [answerLocked, setAnswerLocked] = useState(false);
   const [freezeBonusMs, setFreezeBonusMs] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [revealFeedback, setRevealFeedback] = useState<PlayerRevealPayload | null>(null);
+  const [wagerAmount, setWagerAmount] = useState(0);
+  const [wagerExtraHint, setWagerExtraHint] = useState<string | null>(null);
+  const [wagerSiren, setWagerSiren] = useState(false);
+  const [spotlight, setSpotlight] = useState<WagerSpotlightPayload | null>(null);
+
+  /** Frozen speed bonus preview at the moment the player locked in */
+  const [lockedInBonusPreview, setLockedInBonusPreview] = useState<number | null>(null);
 
   const [playerId, setPlayerId] = useState<string | null>(null);
   const localStorageChecked = useRef(false);
   const joinAttemptedRef = useRef(false);
+  const currentQuestionIdRef = useRef<string | null>(null);
+
+  /** Revive shrine state: 'idle' | 'pending' | 'approved' | 'declined' */
+  const [reviveStatus, setReviveStatus] = useState<'idle' | 'pending' | 'approved' | 'declined'>(
+    'idle'
+  );
 
   const addLog = useCallback((msg: string) => {
     setLog((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 30));
@@ -62,47 +85,151 @@ export default function PlayRoomClient({ code }: { code: string }) {
     []
   );
 
+  // ── Rejoin/resume helper (called on initial connect AND every reconnect) ──
+  const rejoinRoom = useCallback(() => {
+    if (!roomCode) return;
+    const s = getSocket();
+    const currentPid = playerId ?? localStorage.getItem(`${LS_PLAYER_ID_PREFIX}${roomCode}`);
+
+    if (currentPid) {
+      // Try to resume with existing playerId
+      s.emit(
+        'room:resume',
+        { code: roomCode, playerId: currentPid },
+        (ack: Ack<{ room: PublicRoomState; isHost: boolean }>) => {
+          if (!ack.ok) {
+            // Stale playerId — clear it so join can proceed
+            logger.warn({ error: ack.error }, 'room:resume failed, clearing stale playerId');
+            localStorage.removeItem(`${LS_PLAYER_ID_PREFIX}${roomCode}`);
+            setPlayerId(null);
+            joinAttemptedRef.current = false;
+            // Fall back to watch
+            s.emit('room:watch', { code: roomCode }, (watchAck: Ack<{ room: PublicRoomState }>) => {
+              if (watchAck.ok) setRoom(watchAck.data.room);
+            });
+            return;
+          }
+          setError(null);
+          setRoom(ack.data.room);
+          addLog('✅ Resumed');
+        }
+      );
+    } else {
+      // No playerId yet — just watch
+      s.emit('room:watch', { code: roomCode }, (ack: Ack<{ room: PublicRoomState }>) => {
+        if (!ack.ok) return setError(ack.error);
+        setError(null);
+        setRoom(ack.data.room);
+      });
+    }
+  }, [roomCode, playerId, addLog]);
+
+  // ── Socket event listeners (stable, registered once) ──
   useEffect(() => {
     const s = getSocket();
     const onRoomState = (nextRoom: PublicRoomState) => {
+      currentQuestionIdRef.current = nextRoom.currentQuestion?.question.id ?? null;
+      if (nextRoom.phase !== 'wager') setSpotlight(null);
       setRoom((prev) => {
         if (nextRoom.currentQuestion?.question.id !== prev?.currentQuestion?.question.id) {
           setSelectedAnswer(null);
-          setAnswerLocked(false);
           setRemovedIndexes(null);
           setFreezeBonusMs(0);
+          setRevealFeedback(null);
+          setLockedInBonusPreview(null);
         }
+
+        // Reset High Stakes UI when a new wager window starts or we leave the wager act
+        if (nextRoom.wager?.endsAt !== prev?.wager?.endsAt) {
+          setWagerExtraHint(null);
+          setSpotlight(null);
+          setWagerSiren(false);
+        }
+        if (nextRoom.currentAct?.id !== 'wager_round') {
+          setWagerExtraHint(null);
+          setSpotlight(null);
+          setWagerSiren(false);
+        }
+
         return nextRoom;
       });
     };
+    const onPlayerReveal = (payload: PlayerRevealPayload) => {
+      const currentId = currentQuestionIdRef.current;
+      if (currentId && payload.questionId !== currentId) return;
+      setRevealFeedback(payload);
+    };
+    const onRevivePending = () => setReviveStatus('pending');
+    const onReviveResult = (payload: { approved: boolean }) => {
+      setReviveStatus(payload.approved ? 'approved' : 'declined');
+      setTimeout(() => setReviveStatus('idle'), 3000);
+    };
+
+    const onWagerExtraHint = (payload: { text: string }) => {
+      setWagerExtraHint(payload.text);
+    };
+
+    const onWagerFiftyFifty = (payload: { removedIndexes: number[] }) => {
+      setRemovedIndexes(payload.removedIndexes);
+      setSelectedAnswer((prev) =>
+        prev !== null && payload.removedIndexes.includes(prev) ? null : prev
+      );
+    };
+
+    const onWagerSiren = () => {
+      setWagerSiren(true);
+      setTimeout(() => setWagerSiren(false), 1200);
+    };
+
+    const onWagerSpotlight = (payload: WagerSpotlightPayload) => {
+      // Host-controlled spotlight: stays up until the host starts the question
+      setSpotlight(payload);
+    };
+
     s.on('room:state', onRoomState);
+    s.on('player:reveal', onPlayerReveal);
+    s.on('revive:pending', onRevivePending);
+    s.on('revive:result', onReviveResult);
+    s.on('wager:extra_hint', onWagerExtraHint);
+    s.on('wager:fifty_fifty', onWagerFiftyFifty);
+    s.on('wager:siren', onWagerSiren);
+    s.on('wager:spotlight', onWagerSpotlight);
+
     return () => {
       s.off('room:state', onRoomState);
+      s.off('player:reveal', onPlayerReveal);
+      s.off('revive:pending', onRevivePending);
+      s.off('revive:result', onReviveResult);
+      s.off('wager:extra_hint', onWagerExtraHint);
+      s.off('wager:fifty_fifty', onWagerFiftyFifty);
+      s.off('wager:siren', onWagerSiren);
+      s.off('wager:spotlight', onWagerSpotlight);
     };
   }, []);
 
   useEffect(() => {
-    if (!roomCode) return;
-    emit<{ room: PublicRoomState }>('room:watch', { code: roomCode }, (ack) => {
-      if (!ack.ok) return setError(ack.error);
-      setError(null);
-      setRoom(ack.data.room);
-    });
-  }, [emit, roomCode]);
+    const t = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(t);
+  }, []);
 
+  // ── Initial connect + reconnect: re-watch/resume the room ──
   useEffect(() => {
-    if (!roomCode || !playerId) return;
-    emit<{ room: PublicRoomState; isHost: boolean }>(
-      'room:resume',
-      { code: roomCode, playerId },
-      (ack) => {
-        if (!ack.ok) return console.warn('room:resume failed:', ack.error);
-        setError(null);
-        setRoom(ack.data.room);
-        addLog('✅ Resumed');
-      }
-    );
-  }, [emit, playerId, roomCode, addLog]);
+    if (!roomCode) return;
+    const s = getSocket();
+
+    // Fire immediately if already connected
+    if (s.connected) rejoinRoom();
+
+    // Also fire on every (re)connect
+    const onConnect = () => {
+      logger.info({ roomCode }, 'socket (re)connected, rejoining room');
+      rejoinRoom();
+    };
+    s.on('connect', onConnect);
+    return () => {
+      s.off('connect', onConnect);
+    };
+  }, [roomCode, rejoinRoom]);
 
   const doJoin = useCallback(
     (joinName: string) => {
@@ -138,19 +265,66 @@ export default function PlayRoomClient({ code }: { code: string }) {
   const submitAnswer = useCallback(
     (answerIndex: number) => {
       if (!playerId) return;
+      const prev = selectedAnswer;
       setSelectedAnswer(answerIndex);
-      setAnswerLocked(true);
       emit<{ accepted: boolean }>(
         'player:answer',
         { code: roomCode, playerId, answerIndex },
         (ack) => {
           if (!ack.ok) {
             setError(ack.error);
-            setAnswerLocked(false);
+            setSelectedAnswer(prev ?? null);
             addLog(`❌ ${ack.error}`);
-          } else addLog(`✅ Answered: ${String.fromCharCode(65 + answerIndex)}`);
+          } else {
+            addLog(`✅ Selected: ${String.fromCharCode(65 + answerIndex)}`);
+          }
         }
       );
+    },
+    [emit, playerId, roomCode, addLog, selectedAnswer]
+  );
+
+  const lockIn = useCallback(() => {
+    if (!playerId) return;
+
+    // Snapshot the potential bonus at lock-in time
+    const lockTime = Date.now();
+
+    emit<{ room: PublicRoomState }>('player:lockin', { code: roomCode, playerId }, (ack) => {
+      if (!ack.ok) {
+        setError(ack.error);
+        addLog(`❌ Lock in: ${ack.error}`);
+      } else {
+        setError(null);
+        setRoom((prev) => {
+          // Compute preview from what we know client-side
+          const sbMax = prev?.currentAct?.speedBonusMax ?? 0;
+          const startedAt = prev?.currentQuestion?.startedAt ?? lockTime;
+          const baseDurationMs = (prev?.currentQuestion?.endsAt ?? lockTime) - startedAt;
+          if (sbMax > 0 && baseDurationMs > 0) {
+            const elapsed = lockTime - startedAt;
+            const frac = Math.max(0, 1 - elapsed / baseDurationMs);
+            setLockedInBonusPreview(Math.floor(sbMax * frac));
+          }
+          return ack.data.room;
+        });
+        addLog('🔒 Locked in!');
+      }
+    });
+  }, [emit, playerId, roomCode, addLog]);
+
+  const submitWager = useCallback(
+    (amount: number) => {
+      if (!playerId) return;
+      emit<{ room: PublicRoomState }>('wager:set', { code: roomCode, playerId, amount }, (ack) => {
+        if (!ack.ok) {
+          setError(ack.error);
+          addLog(`❌ Wager: ${ack.error}`);
+        } else {
+          setError(null);
+          setRoom(ack.data.room);
+        }
+      });
     },
     [emit, playerId, roomCode, addLog]
   );
@@ -182,13 +356,18 @@ export default function PlayRoomClient({ code }: { code: string }) {
         } else {
           setError(null);
           setRoom(ack.data.room);
-          if (ack.data.removedIndexes) setRemovedIndexes(ack.data.removedIndexes);
+          if (ack.data.removedIndexes) {
+            setRemovedIndexes(ack.data.removedIndexes);
+            if (selectedAnswer !== null && ack.data.removedIndexes.includes(selectedAnswer)) {
+              setSelectedAnswer(null);
+            }
+          }
           if (ack.data.bonusMs) setFreezeBonusMs((prev) => prev + (ack.data.bonusMs ?? 0));
           addLog(`✅ Used ${ITEM_META[itemId].name}`);
         }
       });
     },
-    [emit, playerId, roomCode, addLog]
+    [emit, playerId, roomCode, addLog, selectedAnswer]
   );
 
   const doBuyback = useCallback(() => {
@@ -205,15 +384,75 @@ export default function PlayRoomClient({ code }: { code: string }) {
     });
   }, [emit, playerId, roomCode, addLog]);
 
+  const requestRevive = useCallback(() => {
+    if (!playerId) return;
+    emit<{ pending: true }>('revive:request', { code: roomCode, playerId }, (ack) => {
+      if (!ack.ok) {
+        setError(ack.error);
+        addLog(`❌ Revive: ${ack.error}`);
+      } else {
+        setError(null);
+        setReviveStatus('pending');
+        addLog('🙏 Revive requested — waiting for host…');
+      }
+    });
+  }, [emit, playerId, roomCode, addLog]);
+
   /* ── Derived ── */
 
   const phase = room?.phase ?? 'lobby';
   const q = room?.currentQuestion;
   const me = room?.players.find((p) => p.playerId === playerId);
+  const wager = room?.wager;
   const shopOpen = room?.shop?.open ?? false;
+  const isCountdown = phase === 'countdown';
+  const isWager = phase === 'wager';
   const isQuestionPhase = phase === 'question' || phase === 'boss';
+  const currentAct = room?.currentAct;
 
-  // Separate inventory into active vs passive for display
+  // ── Countdown state ──
+  const countdownEndsAt = q?.countdownEndsAt ?? 0;
+  const countdownMsLeft = isCountdown ? Math.max(0, countdownEndsAt - now) : 0;
+  const countdownSecondsLeft = Math.ceil(countdownMsLeft / 1000);
+
+  // ── Question timer (only ticks after countdown ends) ──
+  const revealAt = q ? (q.revealAt ?? q.endsAt) : 0;
+  const personalEndsAt = q ? q.endsAt + freezeBonusMs : 0;
+  const playerEndsAt = q ? Math.min(revealAt, personalEndsAt) : 0;
+  const msLeft = q ? Math.max(0, playerEndsAt - now) : 0;
+  const secondsLeft = q ? Math.ceil(msLeft / 1000) : 0;
+  const totalMs = q ? Math.max(1, playerEndsAt - q.startedAt) : 1;
+  const remainingFrac = q ? Math.max(0, Math.min(1, msLeft / totalMs)) : 0;
+  const timeUp = q ? now >= playerEndsAt : false;
+  const revealedCorrectIndex = q?.revealedAnswerIndex;
+
+  // ── Wager timer ──
+  const wagerEndsAt = wager?.endsAt ?? 0;
+  const wagerSecondsLeft = isWager ? Math.max(0, Math.ceil((wagerEndsAt - now) / 1000)) : 0;
+
+  const wagerStage = (wager?.stage ?? 'blind') as WagerStage;
+  const wagerStageIndex =
+    wagerStage === 'blind'
+      ? 0
+      : wagerStage === 'category'
+        ? 1
+        : wagerStage === 'hint'
+          ? 2
+          : wagerStage === 'redline'
+            ? 3
+            : wagerStage === 'closing'
+              ? 4
+              : 5;
+  const wagerNoDecreases = wager?.noDecreases ?? false;
+
+  // ── Blackout twist ──
+  const blackoutUntil = q?.blackoutUntil ?? 0;
+  const isBlackout = isQuestionPhase && blackoutUntil > 0 && now < blackoutUntil;
+
+  const activePlayers = (room?.players ?? []).filter((p) => p.connected && !p.eliminated);
+  const lockedInCount = activePlayers.filter((p) => p.lockedIn).length;
+  const activeCount = activePlayers.length;
+
   const activeItems = Object.entries(me?.inventory ?? {}).filter(
     ([id, count]) => count > 0 && ITEM_META[id as ShopItemId]?.kind === 'active'
   ) as [ShopItemId, number][];
@@ -222,9 +461,153 @@ export default function PlayRoomClient({ code }: { code: string }) {
     ([id, count]) => count > 0 && ITEM_META[id as ShopItemId]?.kind === 'passive'
   ) as [ShopItemId, number][];
 
+  const isBossAct = currentAct?.id === 'boss_fight';
+  const canRequestRevive =
+    !!me?.eliminated && !isQuestionPhase && !isBossAct && reviveStatus === 'idle';
+
+  // ── High Stakes: Tier preview (based on your CURRENT wager slider) ──
+  const myScore = Math.max(0, me?.score ?? 0);
+  const myRatio = myScore > 0 ? wagerAmount / myScore : 0;
+  const myTier: WagerTier =
+    myScore > 0 && wagerAmount >= myScore
+      ? 'ALL_IN'
+      : myRatio >= 0.8
+        ? 'INSANE'
+        : myRatio >= 0.5
+          ? 'HIGH_ROLLER'
+          : myRatio >= 0.25
+            ? 'BOLD'
+            : 'SAFE';
+  const myTierIndex =
+    myTier === 'SAFE'
+      ? 0
+      : myTier === 'BOLD'
+        ? 1
+        : myTier === 'HIGH_ROLLER'
+          ? 2
+          : myTier === 'INSANE'
+            ? 3
+            : 4;
+  const isAllInCommitted =
+    currentAct?.id === 'wager_round' &&
+    (me?.score ?? 0) > 0 &&
+    (me?.wager ?? 0) >= (me?.score ?? 0);
+  const canFinalSwap =
+    !!isAllInCommitted &&
+    !!me?.lockedIn &&
+    !me?.wagerSwapUsed &&
+    isQuestionPhase &&
+    !q?.locked &&
+    !timeUp &&
+    !me?.eliminated;
+
+  // Keep local wager slider in sync when entering wager phase
+  // (deferred to avoid sync setState inside effect warnings)
+  const hasMe = !!me;
+  const myEliminated = !!me?.eliminated;
+  const myWager = me?.wager ?? 0;
+  useEffect(() => {
+    if (!isWager) return;
+    if (!hasMe || myEliminated) return;
+
+    const t = setTimeout(() => {
+      setWagerAmount((prev) => (prev === myWager ? prev : myWager));
+    }, 0);
+
+    return () => clearTimeout(t);
+  }, [isWager, hasMe, myEliminated, myWager]);
+
+  // ── Speed Bonus Preview (live countdown, client-only) ──
+  const speedBonusMax = currentAct?.speedBonusMax ?? 0;
+  const baseDurationMs = q ? q.endsAt - q.startedAt : 0;
+  const liveSpeedBonus =
+    q && isQuestionPhase && !q.locked && speedBonusMax > 0 && baseDurationMs > 0
+      ? Math.max(0, Math.floor(speedBonusMax * (1 - (now - q.startedAt) / baseDurationMs)))
+      : 0;
+  // Show frozen value if locked in, otherwise live value
+  const displaySpeedBonus = me?.lockedIn ? (lockedInBonusPreview ?? 0) : liveSpeedBonus;
+
   if (!roomCode) {
     return (
-      <main className="min-h-screen p-6">
+      <main className="min-h-full p-6">
+        {spotlight && isWager && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+            <div className="w-full max-w-lg rounded-3xl border border-pink-200 bg-white p-6 shadow-2xl">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-sm font-semibold text-pink-700">🎥 Spotlight</div>
+                  <div className="text-2xl font-black text-pink-800">HIGH STAKES LOCKED</div>
+                </div>
+                <div className="rounded-xl bg-pink-50 px-3 py-2 text-right">
+                  <div className="text-xs font-semibold text-pink-700">POT</div>
+                  <div className="text-lg font-black text-pink-900 tabular-nums">
+                    {spotlight.totalWagered}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+                <div className="rounded-2xl border bg-neutral-50 p-3">
+                  <div className="text-[11px] font-semibold text-neutral-600">ALL IN</div>
+                  <div className="text-xl font-black tabular-nums">{spotlight.allInCount}</div>
+                </div>
+                <div className="rounded-2xl border bg-neutral-50 p-3">
+                  <div className="text-[11px] font-semibold text-neutral-600">NO BET</div>
+                  <div className="text-xl font-black tabular-nums">{spotlight.noBetCount}</div>
+                </div>
+                <div className="rounded-2xl border bg-neutral-50 p-3">
+                  <div className="text-[11px] font-semibold text-neutral-600">BIGGEST</div>
+                  <div className="text-sm font-black">
+                    {spotlight.biggest ? spotlight.biggest.name : '—'}
+                  </div>
+                </div>
+              </div>
+
+              {spotlight.topRisk.length > 0 ? (
+                <div className="mt-4">
+                  <div className="text-xs font-bold text-neutral-600">Top risk takers</div>
+                  <div className="mt-2 space-y-2">
+                    {spotlight.topRisk.map((e, idx) => (
+                      <div
+                        key={e.playerId}
+                        className="flex items-center justify-between rounded-2xl border bg-white px-4 py-3"
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="text-lg font-black">#{idx + 1}</div>
+                          <div>
+                            <div className="text-sm font-bold">{e.name}</div>
+                            <div className="text-[11px] text-neutral-500">
+                              Bet {e.wager} ({Math.round(e.ratio * 100)}%)
+                            </div>
+                          </div>
+                        </div>
+                        <div className="text-sm font-black">
+                          {e.tier === 'ALL_IN'
+                            ? '🟥 ALL IN'
+                            : e.tier === 'INSANE'
+                              ? '😈 INSANE'
+                              : e.tier === 'HIGH_ROLLER'
+                                ? '🎲 HIGH ROLLER'
+                                : e.tier === 'BOLD'
+                                  ? '💪 BOLD'
+                                  : '🙂 SAFE'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-4 rounded-2xl border bg-neutral-50 p-4 text-sm font-semibold text-neutral-700">
+                  No one placed a bet… coward meta 😅
+                </div>
+              )}
+
+              <div className="mt-4 text-center text-xs font-semibold text-neutral-500">
+                Waiting for the host to start the High Stakes question…
+              </div>
+            </div>
+          </div>
+        )}
         <div className="mx-auto max-w-md rounded-2xl border p-6">
           <h1 className="text-xl font-bold">Invalid room</h1>
         </div>
@@ -233,7 +616,85 @@ export default function PlayRoomClient({ code }: { code: string }) {
   }
 
   return (
-    <main className="min-h-screen p-6">
+    <main className="min-h-full p-6">
+      {spotlight && isWager && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+          <div className="w-full max-w-lg rounded-3xl border border-pink-200 bg-white p-6 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-sm font-semibold text-pink-700">🎥 Spotlight</div>
+                <div className="text-2xl font-black text-pink-800">HIGH STAKES LOCKED</div>
+              </div>
+              <div className="rounded-xl bg-pink-50 px-3 py-2 text-right">
+                <div className="text-xs font-semibold text-pink-700">POT</div>
+                <div className="text-lg font-black text-pink-900 tabular-nums">
+                  {spotlight.totalWagered}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+              <div className="rounded-2xl border bg-neutral-50 p-3">
+                <div className="text-[11px] font-semibold text-neutral-600">ALL IN</div>
+                <div className="text-xl font-black tabular-nums">{spotlight.allInCount}</div>
+              </div>
+              <div className="rounded-2xl border bg-neutral-50 p-3">
+                <div className="text-[11px] font-semibold text-neutral-600">NO BET</div>
+                <div className="text-xl font-black tabular-nums">{spotlight.noBetCount}</div>
+              </div>
+              <div className="rounded-2xl border bg-neutral-50 p-3">
+                <div className="text-[11px] font-semibold text-neutral-600">BIGGEST</div>
+                <div className="text-sm font-black">
+                  {spotlight.biggest ? spotlight.biggest.name : '—'}
+                </div>
+              </div>
+            </div>
+
+            {spotlight.topRisk.length > 0 ? (
+              <div className="mt-4">
+                <div className="text-xs font-bold text-neutral-600">Top risk takers</div>
+                <div className="mt-2 space-y-2">
+                  {spotlight.topRisk.map((e, idx) => (
+                    <div
+                      key={e.playerId}
+                      className="flex items-center justify-between rounded-2xl border bg-white px-4 py-3"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="text-lg font-black">#{idx + 1}</div>
+                        <div>
+                          <div className="text-sm font-bold">{e.name}</div>
+                          <div className="text-[11px] text-neutral-500">
+                            Bet {e.wager} ({Math.round(e.ratio * 100)}%)
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-sm font-black">
+                        {e.tier === 'ALL_IN'
+                          ? '🟥 ALL IN'
+                          : e.tier === 'INSANE'
+                            ? '😈 INSANE'
+                            : e.tier === 'HIGH_ROLLER'
+                              ? '🎲 HIGH ROLLER'
+                              : e.tier === 'BOLD'
+                                ? '💪 BOLD'
+                                : '🙂 SAFE'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-4 rounded-2xl border bg-neutral-50 p-4 text-sm font-semibold text-neutral-700">
+                No one placed a bet… coward meta 😅
+              </div>
+            )}
+
+            <div className="mt-4 text-center text-xs font-semibold text-neutral-500">
+              Next up: the High Stakes question…
+            </div>
+          </div>
+        </div>
+      )}
       <div className="mx-auto max-w-3xl space-y-5">
         {/* ── Header + Stats + Buffs ── */}
         <header className="rounded-2xl border p-5">
@@ -245,8 +706,15 @@ export default function PlayRoomClient({ code }: { code: string }) {
                 Code: <span className="font-mono font-semibold">{roomCode}</span>
               </div>
             </div>
-            <div className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-semibold">
-              {phase}
+            <div className="text-right">
+              <div className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-semibold">
+                {phase}
+              </div>
+              {currentAct && (
+                <div className="mt-1 text-xs text-neutral-500">
+                  {currentAct.emoji} {currentAct.name}
+                </div>
+              )}
             </div>
           </div>
 
@@ -265,7 +733,6 @@ export default function PlayRoomClient({ code }: { code: string }) {
             </div>
           )}
 
-          {/* Passive buff indicators */}
           {me &&
             (me.buffs?.doublePoints ||
               me.buffs?.shield ||
@@ -291,7 +758,50 @@ export default function PlayRoomClient({ code }: { code: string }) {
 
           {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
         </header>
-
+        {/* ── Act Banner ── */}
+        {currentAct && (
+          <section
+            className={`rounded-2xl border p-4 ${
+              currentAct.heartsAtRisk ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold">
+                  {currentAct.emoji} {currentAct.name}
+                </h2>
+                <p className="text-xs text-neutral-600">{currentAct.description}</p>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <span
+                  className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                    currentAct.heartsAtRisk
+                      ? 'bg-red-100 text-red-700'
+                      : 'bg-green-100 text-green-700'
+                  }`}
+                >
+                  {currentAct.heartsAtRisk ? '❤️ Hearts at risk' : '🛡️ Hearts safe'}
+                </span>
+                <span className="text-xs text-neutral-500">
+                  Q{currentAct.questionNumber}/{currentAct.totalQuestions}
+                </span>
+              </div>
+            </div>
+          </section>
+        )}
+        {/* ── Intermission ── */}
+        {phase === 'intermission' && (
+          <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5">
+            <h2 className="text-lg font-semibold text-blue-800">🎬 Intermission</h2>
+            <p className="mt-1 text-sm text-blue-700">
+              {currentAct?.name} is complete! Take a breather — the host will start the next act
+              soon.
+            </p>
+            {shopOpen && (
+              <p className="mt-2 text-sm font-medium text-purple-700">🛒 The shop is open!</p>
+            )}
+          </section>
+        )}
         {/* ── Join ── */}
         {!playerId && !nameFromUrl && (
           <section className="rounded-2xl border p-5">
@@ -317,101 +827,565 @@ export default function PlayRoomClient({ code }: { code: string }) {
           <section className="rounded-2xl border p-5">
             <p className="text-sm text-neutral-600">Joining as {nameFromUrl}…</p>
           </section>
-        )}
+        )}{' '}
+        {/* ── Wager Phase ── */}
+        {isWager && wager && (
+          <section className="rounded-2xl border border-pink-200 bg-pink-50 p-5">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold text-pink-800">🎰 High Stakes — Redline</h2>
+                <p className="mt-1 text-sm text-pink-700">
+                  Bet any amount of your points. Right = win your bet. Wrong = lose it.
+                </p>
+              </div>
 
+              <div
+                className={`rounded-xl border bg-white px-3 py-1.5 text-sm font-semibold tabular-nums ${
+                  wagerSiren ? 'animate-pulse border-red-400 bg-red-50 text-red-700' : ''
+                }`}
+              >
+                {wagerSecondsLeft}s
+              </div>
+            </div>
+
+            <div className="mt-3 rounded-xl border bg-white p-4">
+              <div className="text-sm font-semibold text-neutral-800">
+                Category: <span className="font-bold">{wager.category ?? '???'}</span>
+              </div>
+
+              <div className="mt-1 text-sm text-neutral-600">
+                Hint: <span className="font-medium">{wager.hint ?? '???'}</span>
+              </div>
+
+              {wagerExtraHint ? (
+                <div className="mt-2 rounded-lg border border-pink-200 bg-pink-50 px-3 py-2 text-sm text-pink-900">
+                  <span className="font-semibold">🔥 Extra hint:</span>{' '}
+                  <span className="font-medium">{wagerExtraHint}</span>
+                </div>
+              ) : null}
+
+              <div className="mt-2 text-xs text-neutral-600">
+                Stage: <span className="font-bold">{wagerStage.toUpperCase()}</span>
+                {wagerNoDecreases ? (
+                  <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">
+                    🚨 NO DECREASES
+                  </span>
+                ) : null}
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                {[
+                  ['blind', '???'],
+                  ['category', 'Category'],
+                  ['hint', 'Hint'],
+                  ['redline', 'REDLINE'],
+                  ['closing', 'Closing'],
+                ].map(([id, label]) => {
+                  const idx =
+                    id === 'blind'
+                      ? 0
+                      : id === 'category'
+                        ? 1
+                        : id === 'hint'
+                          ? 2
+                          : id === 'redline'
+                            ? 3
+                            : 4;
+                  const done = wagerStageIndex >= idx;
+                  return (
+                    <span
+                      key={id}
+                      className={`rounded-full border px-2 py-0.5 font-semibold ${
+                        done
+                          ? 'border-pink-500 bg-pink-100 text-pink-800'
+                          : 'border-neutral-200 bg-white text-neutral-500'
+                      }`}
+                    >
+                      {label}
+                    </span>
+                  );
+                })}
+              </div>
+
+              {!wager.open ? (
+                <div className="mt-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 text-sm font-semibold text-neutral-700">
+                  🔒 Wagers locked — Spotlight in progress…
+                </div>
+              ) : null}
+            </div>
+
+            {me?.eliminated ? (
+              <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-800">
+                💀 You’re eliminated — no wagering this round.
+              </div>
+            ) : (
+              <div className="mt-4 rounded-xl border bg-white p-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-semibold">Your wager</div>
+                  <div className="text-sm font-bold tabular-nums">{wagerAmount}</div>
+                </div>
+
+                <input
+                  className="mt-3 w-full"
+                  type="range"
+                  min={0}
+                  max={Math.max(0, me?.score ?? 0)}
+                  step={10}
+                  value={Math.min(wagerAmount, Math.max(0, me?.score ?? 0))}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    setWagerAmount((prev) => (wagerNoDecreases && next < prev ? prev : next));
+                  }}
+                  disabled={!me || !wager.open}
+                />
+
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {[0, 25, 50, 100].map((pct) => {
+                    const max = Math.max(0, me?.score ?? 0);
+                    const val = pct === 0 ? 0 : Math.floor((max * pct) / 100);
+                    return (
+                      <button
+                        key={pct}
+                        type="button"
+                        className="rounded-xl border px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
+                        onClick={() =>
+                          setWagerAmount((prev) => (wagerNoDecreases && val < prev ? prev : val))
+                        }
+                        disabled={!me || !wager.open}
+                      >
+                        {pct === 0 ? '0' : `${pct}%`}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 font-black ${
+                      myTier === 'ALL_IN'
+                        ? 'bg-red-100 text-red-700'
+                        : myTier === 'INSANE'
+                          ? 'bg-purple-100 text-purple-700'
+                          : myTier === 'HIGH_ROLLER'
+                            ? 'bg-amber-100 text-amber-800'
+                            : myTier === 'BOLD'
+                              ? 'bg-blue-100 text-blue-700'
+                              : 'bg-neutral-100 text-neutral-600'
+                    }`}
+                  >
+                    {myTier === 'ALL_IN'
+                      ? '🟥 ALL IN'
+                      : myTier === 'INSANE'
+                        ? '😈 INSANE'
+                        : myTier === 'HIGH_ROLLER'
+                          ? '🎲 HIGH ROLLER'
+                          : myTier === 'BOLD'
+                            ? '💪 BOLD'
+                            : '🙂 SAFE'}
+                  </span>
+
+                  {myTierIndex >= 1 && (
+                    <span className="rounded-full border border-pink-200 bg-pink-50 px-2 py-0.5 font-semibold text-pink-800">
+                      🔥 Extra hint at REDLINE
+                    </span>
+                  )}
+                  {myTierIndex >= 2 && (
+                    <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 font-semibold text-amber-800">
+                      ✂️ Auto 50/50 (question)
+                    </span>
+                  )}
+                  {myTier === 'ALL_IN' && (
+                    <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 font-semibold text-red-800">
+                      🔁 Final swap (once)
+                    </span>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  className="mt-3 w-full rounded-xl bg-pink-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-pink-700 disabled:opacity-40"
+                  disabled={!me || wagerSecondsLeft <= 0 || !wager.open}
+                  onClick={() => submitWager(wagerAmount)}
+                >
+                  {!wager.open
+                    ? 'Wagers Locked'
+                    : me?.wagerSubmitted
+                      ? 'Update Wager'
+                      : 'Place Wager'}
+                </button>
+
+                <div className="mt-2 text-xs text-neutral-500">
+                  You have <span className="font-semibold">{me?.score ?? 0}</span> points available.
+                  Total wagered by everyone:{' '}
+                  <span className="font-semibold">{wager.totalWagered}</span>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
         {/* ── Question + Answers ── */}
         {q && (
           <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">
-                {phase === 'boss' ? '🐉 Boss Question' : '❓ Question'}
+                {phase === 'boss'
+                  ? '🐉 Boss Question'
+                  : isCountdown
+                    ? '⏳ Get Ready!'
+                    : '❓ Question'}
               </h2>
-              <span className="text-xs text-neutral-500">
-                {q.question.value} pts · {q.question.category}
-              </span>
+              <div className="flex items-center gap-2">
+                {q.question.hard && (
+                  <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-bold text-red-700">
+                    ⚠️ HARD
+                  </span>
+                )}
+                <span className="text-xs text-neutral-500">
+                  {q.question.value} pts · {q.question.category}
+                </span>
+              </div>
             </div>
 
-            {freezeBonusMs > 0 && (
-              <p className="mt-1 text-xs font-medium text-blue-600">
-                ⏱️ +{freezeBonusMs / 1000}s bonus time!
-              </p>
-            )}
-
-            <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
-
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {q.question.choices.map((choice, i) => {
-                const isRemoved = removedIndexes?.includes(i);
-                const isSelected = selectedAnswer === i;
-                return (
-                  <button
-                    key={i}
-                    type="button"
-                    disabled={answerLocked || q.locked || !!me?.eliminated || !!isRemoved}
-                    onClick={() => submitAnswer(i)}
-                    className={`rounded-xl border-2 px-4 py-3 text-left text-sm font-medium transition-all ${
-                      isRemoved
-                        ? 'border-neutral-200 bg-neutral-100 text-neutral-400 line-through'
-                        : isSelected
-                          ? 'border-blue-500 bg-blue-50 text-blue-800'
-                          : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
-                    } disabled:cursor-not-allowed`}
-                  >
-                    <span className="mr-2 font-bold text-neutral-400">
-                      {String.fromCharCode(65 + i)}
-                    </span>
-                    {choice}
-                    {isSelected && ' ✓'}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Active items — usable during question */}
-            {isQuestionPhase && !answerLocked && activeItems.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-2 border-t border-amber-200 pt-3">
-                <span className="self-center text-xs text-neutral-500">Use:</span>
-                {activeItems.map(([itemId, count]) => (
-                  <button
-                    key={itemId}
-                    type="button"
-                    onClick={() => handleUseItem(itemId)}
-                    className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50"
-                  >
-                    {ITEM_META[itemId].emoji} {ITEM_META[itemId].name}
-                    {count > 1 && ` ×${count}`}
-                  </button>
-                ))}
+            {/* ── Countdown Overlay ── */}
+            {isCountdown && (
+              <div className="mt-4 flex flex-col items-center justify-center py-8">
+                <div className="text-7xl font-black text-amber-600 tabular-nums">
+                  {countdownSecondsLeft || '🚀'}
+                </div>
+                <p className="mt-3 text-sm font-semibold text-amber-700">
+                  {countdownSecondsLeft > 0 ? 'Question incoming…' : 'Go!'}
+                </p>
               </div>
             )}
 
-            {answerLocked && (
-              <p className="mt-2 text-xs font-medium text-blue-600">
-                Answer locked! Waiting for reveal…
-              </p>
+            {/* ── Question Content (hidden during countdown) ── */}
+            {!isCountdown && (
+              <>
+                {freezeBonusMs > 0 && (
+                  <p className="mt-1 text-xs font-medium text-blue-600">
+                    ⏱️ +{freezeBonusMs / 1000}s bonus time!
+                  </p>
+                )}
+
+                {/* Timer / Countdown */}
+                <div className="mt-3 rounded-xl border bg-white p-3">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-semibold">
+                      {timeUp ? '\u23F1\uFE0F Time\u2019s up' : '\u23F1\uFE0F Time left'}
+                    </span>
+                    <span className="font-bold tabular-nums">{secondsLeft}s</span>
+                  </div>
+                  <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-neutral-200">
+                    <div
+                      className="h-2 bg-blue-500 transition-[width]"
+                      style={{ width: `${Math.round(remainingFrac * 100)}%` }}
+                    />
+                  </div>
+
+                  {/* Speed Bonus Preview */}
+                  {speedBonusMax > 0 && isQuestionPhase && !q.locked && !me?.eliminated && (
+                    <div className="mt-2 flex items-center justify-between">
+                      <span className="text-xs font-medium text-amber-700">⚡ Speed Bonus</span>
+                      <span
+                        className={`text-sm font-bold tabular-nums ${
+                          me?.lockedIn
+                            ? 'text-green-600'
+                            : displaySpeedBonus > 0
+                              ? 'text-amber-600'
+                              : 'text-neutral-400'
+                        }`}
+                      >
+                        {me?.lockedIn
+                          ? `🔒 +${displaySpeedBonus}`
+                          : timeUp
+                            ? '+0'
+                            : `+${displaySpeedBonus}`}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <p className="mt-2 text-base font-medium">{q.question.prompt}</p>
+
+                {currentAct?.id === 'wager_round' && wagerExtraHint ? (
+                  <div className="mt-2 rounded-xl border border-pink-200 bg-pink-50 p-3 text-sm font-semibold text-pink-900">
+                    🔥 Extra hint: <span className="font-medium">{wagerExtraHint}</span>
+                  </div>
+                ) : null}
+
+                {currentAct?.id === 'wager_round' && removedIndexes?.length ? (
+                  <div className="mt-2 text-xs font-semibold text-amber-700">
+                    ✂️ High Roller perk active: 2 wrong answers removed
+                  </div>
+                ) : null}
+
+                {isBlackout && (
+                  <div className="mt-3 rounded-xl border border-neutral-200 bg-white p-3 text-sm font-semibold text-neutral-700">
+                    🕶️ Blackout! Choices unlock in{' '}
+                    <span className="tabular-nums">
+                      {Math.max(0, Math.ceil((blackoutUntil - now) / 1000))}s
+                    </span>
+                  </div>
+                )}
+
+                {/* Reveal feedback */}
+                {q.locked && revealFeedback && (
+                  <div
+                    className={`mt-3 rounded-xl border p-3 text-sm font-semibold ${
+                      revealFeedback.correct
+                        ? 'border-green-300 bg-green-50 text-green-800'
+                        : revealFeedback.yourAnswerIndex === null
+                          ? 'border-amber-300 bg-amber-50 text-amber-800'
+                          : 'border-red-300 bg-red-50 text-red-800'
+                    }`}
+                  >
+                    {currentAct?.id === 'wager_round'
+                      ? revealFeedback.correct
+                        ? `🎰 WIN! +${revealFeedback.wagered ?? 0} (bet doubled)`
+                        : revealFeedback.yourAnswerIndex === null
+                          ? '⏱️ No answer submitted'
+                          : `💸 LOST -${revealFeedback.wagered ?? 0}`
+                      : revealFeedback.correct
+                        ? `✅ Correct! +${revealFeedback.scoreDelta} pts`
+                        : revealFeedback.yourAnswerIndex === null
+                          ? '⏱️ No answer submitted'
+                          : '❌ Wrong'}
+                    {revealFeedback.correct && revealFeedback.speedBonus
+                      ? ` (⚡ +${revealFeedback.speedBonus} speed bonus)`
+                      : null}
+                    {currentAct?.id !== 'wager_round' &&
+                      !revealFeedback.heartsAtRisk &&
+                      !revealFeedback.correct &&
+                      revealFeedback.yourAnswerIndex !== null && (
+                        <span className="ml-2 text-green-600">🛡️ No heart lost (safe round)</span>
+                      )}
+                    <span className="ml-2 font-medium text-neutral-700">
+                      {revealFeedback.shieldUsed ? '🛡️ Shield used ' : ''}
+                      {revealFeedback.doublePointsUsed ? '⭐ Double Points used ' : ''}
+                      {revealFeedback.buybackUsed ? '🪙 Buyback used ' : ''}
+                      {revealFeedback.livesDelta !== 0
+                        ? ` · ${revealFeedback.livesDelta} lives`
+                        : ''}
+                      {revealFeedback.coinsDelta !== 0
+                        ? ` · +${revealFeedback.coinsDelta} coins`
+                        : ''}
+                    </span>
+                  </div>
+                )}
+
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {q.question.choices.map((choice, i) => {
+                    const displayChoice = isBlackout ? '???' : choice;
+                    const isRemoved = removedIndexes?.includes(i);
+                    const isSelected = selectedAnswer === i;
+                    const showReveal = q.locked && typeof revealedCorrectIndex === 'number';
+                    const isCorrect = showReveal && i === revealedCorrectIndex;
+                    const yourIdx = revealFeedback?.yourAnswerIndex ?? selectedAnswer;
+                    const isYourPick = yourIdx === i;
+                    const isWrongPick = showReveal && isYourPick && !isCorrect;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        disabled={
+                          isCountdown ||
+                          q.locked ||
+                          isBlackout ||
+                          timeUp ||
+                          !!me?.eliminated ||
+                          (!!me?.lockedIn && !canFinalSwap) ||
+                          !!isRemoved
+                        }
+                        onClick={() => submitAnswer(i)}
+                        className={`rounded-xl border-2 px-4 py-3 text-left text-sm font-medium transition-all ${
+                          isRemoved
+                            ? 'border-neutral-200 bg-neutral-100 text-neutral-400 line-through'
+                            : isCorrect
+                              ? 'border-green-500 bg-green-50 text-green-800'
+                              : isWrongPick
+                                ? 'border-red-500 bg-red-50 text-red-800'
+                                : isSelected
+                                  ? 'border-blue-500 bg-blue-50 text-blue-800'
+                                  : 'border-neutral-200 bg-white hover:border-blue-300 hover:bg-blue-50'
+                        } disabled:cursor-not-allowed`}
+                      >
+                        <span className="mr-2 font-bold text-neutral-400">
+                          {String.fromCharCode(65 + i)}
+                        </span>
+                        {displayChoice}
+                        {showReveal
+                          ? isCorrect
+                            ? ' ✅'
+                            : isWrongPick
+                              ? ' ❌'
+                              : ''
+                          : isSelected
+                            ? ' ✓'
+                            : ''}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Lock In */}
+                {isQuestionPhase && !q.locked && !me?.eliminated && activeCount > 0 && (
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-white p-3">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-semibold text-neutral-700">
+                        🔒 Locked in:{' '}
+                        <span className="tabular-nums">
+                          {lockedInCount}/{activeCount}
+                        </span>
+                      </div>
+
+                      {isAllInCommitted ? (
+                        <div className="text-[11px] font-semibold text-red-700">
+                          {me?.wagerSwapUsed
+                            ? '🔁 Final swap used'
+                            : me?.lockedIn
+                              ? '🔁 Final swap available: tap ONE answer to change once'
+                              : '🟥 ALL IN: lock in to unlock a final swap'}
+                        </div>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={lockIn}
+                      disabled={timeUp || !!me?.lockedIn || selectedAnswer === null}
+                      className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {me?.lockedIn ? '✅ Locked In' : '🔒 Lock In'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Active items — usable during question */}
+                {isQuestionPhase && activeItems.length > 0 && currentAct?.id !== 'wager_round' && (
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-amber-200 pt-3">
+                    <span className="self-center text-xs text-neutral-500">Use:</span>
+                    {activeItems.map(([itemId, count]) => (
+                      <button
+                        key={itemId}
+                        type="button"
+                        disabled={q.locked || timeUp || !!me?.eliminated || !!me?.lockedIn}
+                        onClick={() => handleUseItem(itemId)}
+                        className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {ITEM_META[itemId].emoji} {ITEM_META[itemId].name}
+                        {count > 1 && ` ×${count}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <p className="mt-2 text-xs font-medium text-blue-700">
+                  {isCountdown
+                    ? 'Read the question — answers open in a moment!'
+                    : q.locked
+                      ? 'Answer revealed.'
+                      : timeUp
+                        ? '\u23F1\uFE0F Time\u2019s up \u2014 waiting for the host to reveal\u2026'
+                        : me?.lockedIn
+                          ? canFinalSwap
+                            ? '🔁 Final swap available — tap one answer to change once'
+                            : '🔒 Locked in \u2014 waiting for the host to reveal\u2026'
+                          : selectedAnswer === null
+                            ? 'Tap an answer to submit. You can change it until you lock in or time runs out.'
+                            : `Selected ${String.fromCharCode(65 + selectedAnswer)} \u2014 tap another option to change before you lock in or time runs out.`}
+                </p>
+              </>
             )}
           </section>
         )}
-
         {/* ── Eliminated ── */}
         {me?.eliminated && (
           <section className="rounded-2xl border border-red-200 bg-red-50 p-5">
             <h2 className="text-lg font-semibold text-red-800">💀 You&apos;re Eliminated</h2>
             <p className="mt-1 text-sm text-red-700">
-              Wait for the shop to open, then buy back in with coins.
+              Buy back in with coins, or request a revive from the host.
             </p>
-            {shopOpen && (
-              <button
-                type="button"
-                onClick={doBuyback}
-                className="mt-3 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700"
-              >
-                🪙 Buyback ({room?.config.buybackCostCoins} coins)
-              </button>
-            )}
+            <div className="mt-3 flex flex-wrap gap-2">
+              {shopOpen && (
+                <button
+                  type="button"
+                  onClick={doBuyback}
+                  className="rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700"
+                >
+                  🪙 Buyback ({room?.config.buybackCostCoins} coins)
+                </button>
+              )}
+              {canRequestRevive && (
+                <button
+                  type="button"
+                  onClick={requestRevive}
+                  className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+                >
+                  🙏 Request Revive
+                </button>
+              )}
+              {isBossAct && (
+                <p className="mt-1 text-xs text-neutral-500">
+                  Revive shrine is not available during the Boss Fight.
+                </p>
+              )}
+            </div>
           </section>
         )}
-
+        {/* ── Revive Pending Modal (blocks player screen until host decides) ── */}
+        {reviveStatus === 'pending' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-emerald-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">🙏</div>
+                <h2 className="mt-4 text-2xl font-bold text-emerald-800">Revive Shrine</h2>
+                <p className="mt-3 text-base text-neutral-700">
+                  Your request has been sent to the host!
+                </p>
+                <p className="mt-2 text-sm text-neutral-500">
+                  Complete the forfeit and wait for the host&apos;s decision…
+                </p>
+                <div className="mt-6 flex items-center justify-center gap-2">
+                  <div className="h-2 w-2 animate-bounce rounded-full bg-emerald-500" />
+                  <div
+                    className="h-2 w-2 animate-bounce rounded-full bg-emerald-500"
+                    style={{ animationDelay: '0.15s' }}
+                  />
+                  <div
+                    className="h-2 w-2 animate-bounce rounded-full bg-emerald-500"
+                    style={{ animationDelay: '0.3s' }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* ── Revive Result Toast ── */}
+        {reviveStatus === 'approved' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-green-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">🎉</div>
+                <h2 className="mt-4 text-2xl font-bold text-green-800">You&apos;re Back!</h2>
+                <p className="mt-2 text-base text-neutral-700">
+                  The host approved your revive. Full health restored!
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+        {reviveStatus === 'declined' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-sm rounded-2xl border-2 border-red-400 bg-white p-8 shadow-2xl">
+              <div className="text-center">
+                <div className="text-5xl">😔</div>
+                <h2 className="mt-4 text-2xl font-bold text-red-800">Request Declined</h2>
+                <p className="mt-2 text-base text-neutral-700">
+                  The host declined your revive. Better luck next time!
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
         {/* ── Shop ── */}
         {shopOpen && (
           <section className="rounded-2xl border border-purple-200 bg-purple-50 p-5">
@@ -459,7 +1433,6 @@ export default function PlayRoomClient({ code }: { code: string }) {
             </div>
           </section>
         )}
-
         {/* ── Inventory (non-shop view) ── */}
         {!shopOpen && (passiveItems.length > 0 || activeItems.length > 0) && (
           <section className="rounded-2xl border p-5">
@@ -506,7 +1479,61 @@ export default function PlayRoomClient({ code }: { code: string }) {
             )}
           </section>
         )}
+        {/* ── Final Results ── */}
+        {phase === 'ended' &&
+          (room?.players.length ?? 0) > 0 &&
+          (() => {
+            const sorted = [...(room?.players ?? [])].sort((a, b) => b.score - a.score);
+            const podium = sorted.slice(0, 3);
+            const medals = ['🥇', '🥈', '🥉'];
+            const myRank = sorted.findIndex((p) => p.playerId === playerId);
 
+            return (
+              <section className="rounded-2xl border-2 border-amber-300 bg-linear-to-b from-amber-50 to-white p-6">
+                <h2 className="text-center text-2xl font-bold">🏆 Game Over!</h2>
+
+                {/* Podium */}
+                <div className="mt-5 flex items-end justify-center gap-3">
+                  {podium.map((p, i) => (
+                    <div
+                      key={p.playerId}
+                      className={`flex flex-col items-center rounded-xl border p-3 ${
+                        i === 0
+                          ? 'order-2 min-w-28 border-amber-300 bg-amber-50'
+                          : i === 1
+                            ? 'order-1 min-w-24 border-neutral-300 bg-neutral-50'
+                            : 'order-3 min-w-24 border-orange-200 bg-orange-50'
+                      }`}
+                    >
+                      <span className="text-2xl">{medals[i]}</span>
+                      <span className="mt-1 text-sm font-bold">
+                        {p.name}
+                        {p.playerId === playerId && ' (you)'}
+                      </span>
+                      <span className="mt-0.5 text-lg font-black tabular-nums">{p.score}</span>
+                      <span className="text-xs text-neutral-500">points</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Your stats */}
+                {me && (
+                  <div className="mt-5 rounded-xl border bg-white p-4 text-center">
+                    <p className="text-sm font-semibold">
+                      You finished{' '}
+                      <span className="text-lg font-black text-blue-600">#{myRank + 1}</span> of{' '}
+                      {sorted.length}
+                    </p>
+                    <div className="mt-2 flex justify-center gap-4 text-sm">
+                      <span>⭐ {me.score} pts</span>
+                      <span>🪙 {me.coins} coins</span>
+                      <span>❤️ {me.lives} lives</span>
+                    </div>
+                  </div>
+                )}
+              </section>
+            );
+          })()}
         {/* ── Scoreboard ── */}
         <section className="rounded-2xl border p-5">
           <h2 className="text-lg font-semibold">Scoreboard</h2>
@@ -547,7 +1574,6 @@ export default function PlayRoomClient({ code }: { code: string }) {
               ))}
           </div>
         </section>
-
         {/* ── Event Log ── */}
         <section className="rounded-2xl border p-5">
           <h2 className="text-lg font-semibold">Event Log</h2>

@@ -8,7 +8,7 @@ export default function Home() {
   const [name, setName] = useState('');
 
   return (
-    <main className="flex min-h-screen items-center justify-center p-6">
+    <main className="flex min-h-full items-center justify-center p-6">
       <div className="w-full max-w-md space-y-4 rounded-2xl border p-6">
         <h1 className="text-2xl font-bold">Schooled: Quest Mode</h1>
         <p className="text-sm text-neutral-600">Day 1: live lobby + room codes.</p>

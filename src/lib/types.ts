@@ -6,7 +6,60 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export type Phase = 'lobby' | 'question' | 'reveal' | 'shop' | 'boss' | 'ended';
+export type Phase =
+  | 'lobby'
+  | 'wager'
+  | 'countdown'
+  | 'question'
+  | 'reveal'
+  | 'shop'
+  | 'boss'
+  | 'intermission'
+  | 'ended';
+
+export type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'wager_round' | 'boss_fight';
+
+export type WagerStage = 'blind' | 'category' | 'hint' | 'redline' | 'closing' | 'locked';
+
+export type WagerTier = 'SAFE' | 'BOLD' | 'HIGH_ROLLER' | 'INSANE' | 'ALL_IN';
+
+export type WagerSpotlightEntry = {
+  playerId: string;
+  name: string;
+  wager: number;
+  score: number;
+  ratio: number;
+  tier: WagerTier;
+};
+
+export type WagerSpotlightPayload = {
+  totalWagered: number;
+  allInCount: number;
+  noBetCount: number;
+  biggest?: WagerSpotlightEntry;
+  topRisk: WagerSpotlightEntry[];
+};
+
+export type ActConfig = {
+  id: ActId;
+  name: string;
+  emoji: string;
+  description: string;
+  /** Timer duration for questions in this act (ms) */
+  questionDurationMs: number;
+  /** Whether wrong answers cost hearts */
+  heartsAtRisk: boolean;
+  /** Only lose hearts on "hard" questions (used in Pop Quiz) */
+  heartsOnlyOnHard: boolean;
+  /** Coin reward for correct answer (base, before multipliers) */
+  coinRewardBase: number;
+  /** Score value multiplier for this act (e.g. 1.0, 1.5, 2.0) */
+  scoreMultiplier: number;
+  /** Which shop items are available for purchase during this act's shop windows */
+  availableShopItems: ShopItemId[];
+  /** Max speed bonus points for an instant lock-in (scales linearly with time remaining) */
+  speedBonusMax: number;
+};
 
 export type Player = {
   playerId: string;
@@ -20,7 +73,17 @@ export type Player = {
   coins: number;
   eliminated: boolean;
 
+  /** Whether you have locked in your answer for the current question. */
+  lockedIn: boolean;
+
   inventory: Record<string, number>;
+
+  /** Wager round state (only meaningful during wager_round act) */
+  wager?: number;
+  wagerSubmitted?: boolean;
+
+  /** All-in perk: whether you've already used your one-time final swap this question */
+  wagerSwapUsed?: boolean;
 
   /** Passive buffs currently active — shown as indicators on the player's HUD */
   buffs: {
@@ -33,8 +96,12 @@ export type PublicQuestion = {
   id: string;
   category: string;
   prompt: string;
+  /** Optional hint (used by wager_round pre-bet screen) */
+  hint?: string;
   choices: string[];
   value: number;
+  /** Whether this question is tagged as "hard" (affects heart loss in some acts) */
+  hard?: boolean;
 };
 
 /**
@@ -48,7 +115,6 @@ export type PublicQuestion = {
  * ACTIVE (tap to use during a question):
  *   - fifty_fifty: Removes 2 wrong answers. Use during question phase.
  *   - freeze_time: Adds +10s to your timer. Use during question phase.
- *   - call_audience: Spectators vote, you see poll. Use during question phase.
  */
 export type ShopItemId =
   | 'double_points'
@@ -80,6 +146,7 @@ export type PublicRoomState = {
   config: {
     maxLives: number;
     questionDurationMs: number;
+    countdownMs: number;
     startingCoins: number;
     buybackCostCoins: number;
     bossHp: number;
@@ -87,9 +154,32 @@ export type PublicRoomState = {
   players: Player[];
   currentQuestion?: {
     question: PublicQuestion;
+    /** When the countdown finishes and the question timer starts */
+    countdownEndsAt?: number;
     startedAt: number;
     endsAt: number;
+    /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
+    revealAt: number;
+    /** If set, choices are hidden/disabled until this timestamp (wager_round twist) */
+    blackoutUntil?: number;
     locked: boolean;
+    /** Present only after host reveals. */
+    revealedAnswerIndex?: number;
+  };
+
+  /** Wager mini-round (appears before the wager question countdown) */
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    /** True during/after REDLINE: wagers cannot be decreased */
+    noDecreases: boolean;
+    /** Category is revealed partway through the redline timeline */
+    category?: string;
+    /** Hint is revealed partway through the redline timeline */
+    hint?: string;
+    totalWagered: number;
   };
   shop?: {
     open: boolean;
@@ -97,6 +187,24 @@ export type PublicRoomState = {
   };
   boss?: BossState;
   remainingQuestions: number;
+
+  /** Current act info */
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    description: string;
+    heartsAtRisk: boolean;
+    questionNumber: number;
+    totalQuestions: number;
+    speedBonusMax: number;
+  };
+};
+
+export type ReviveRequest = {
+  playerId: string;
+  playerName: string;
+  requestedAt: number;
 };
 
 export type HostRoomState = {
@@ -106,6 +214,60 @@ export type HostRoomState = {
   currentAnswerIndex?: number;
   correctChoice?: string;
   questionDebug?: JsonValue;
+  /** Act info for host dashboard */
+  currentAct?: {
+    id: ActId;
+    name: string;
+    emoji: string;
+    questionNumber: number;
+    totalQuestions: number;
+    heartsAtRisk: boolean;
+  };
+  /** Available acts the host can advance to */
+  availableActs?: ActId[];
+  /** Wager state (host view) */
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    noDecreases: boolean;
+    /** Host always sees category/hint once available in the pack */
+    category?: string;
+    hint?: string;
+    totalWagered: number;
+  };
+  /** If set, a player is requesting to be revived and host must approve/decline */
+  pendingRevive?: ReviveRequest;
+};
+
+export type PlayerRevealPayload = {
+  questionId: string;
+  correctAnswerIndex: number;
+  yourAnswerIndex: number | null;
+  correct: boolean;
+  scoreDelta: number;
+  coinsDelta: number;
+  livesDelta: number;
+  eliminated: boolean;
+  shieldUsed?: boolean;
+  doublePointsUsed?: boolean;
+  buybackUsed?: boolean;
+  /** Whether hearts were at risk for this question */
+  heartsAtRisk?: boolean;
+  /** Speed bonus points earned (0 if not locked in or wrong) */
+  speedBonus?: number;
+
+  /** Wager amount (only for wager_round) */
+  wagered?: number;
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };
+
+export type PackSummary = {
+  id: string;
+  name: string;
+  description: string;
+  questionCounts: Record<string, number>;
+  totalQuestions: number;
+};
