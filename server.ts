@@ -17,6 +17,7 @@ import { Server } from 'socket.io';
 
 type Phase =
   | 'lobby'
+  | 'wager'
   | 'countdown'
   | 'question'
   | 'reveal'
@@ -24,7 +25,25 @@ type Phase =
   | 'boss'
   | 'intermission'
   | 'ended';
-type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
+type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'wager_round' | 'boss_fight';
+
+type WagerStage = 'blind' | 'category' | 'hint' | 'redline' | 'closing' | 'locked';
+type WagerTier = 'SAFE' | 'BOLD' | 'HIGH_ROLLER' | 'INSANE' | 'ALL_IN';
+type WagerSpotlightEntry = {
+  playerId: string;
+  name: string;
+  wager: number;
+  score: number;
+  ratio: number;
+  tier: WagerTier;
+};
+type WagerSpotlightPayload = {
+  totalWagered: number;
+  allInCount: number;
+  noBetCount: number;
+  biggest?: WagerSpotlightEntry;
+  topRisk: WagerSpotlightEntry[];
+};
 
 type ActConfig = {
   id: ActId;
@@ -59,6 +78,11 @@ type Player = {
 
   inventory: Record<string, number>;
 
+  // Wager round state (only meaningful during wager_round act)
+  wager?: number;
+  wagerSubmitted?: boolean;
+  wagerSwapUsed?: boolean;
+
   buffs: {
     doublePoints: boolean;
     shield: boolean;
@@ -71,6 +95,8 @@ type Question = {
   id: string;
   category: string;
   prompt: string;
+  hint?: string;
+  extraHint?: string;
   choices: string[];
   answerIndex: number;
   value: number;
@@ -95,6 +121,8 @@ type CurrentQuestion = {
   countdownEndsAt?: number;
   startedAt: number;
   endsAt: number;
+  /** If set, choices are hidden/disabled until this timestamp (wager_round twist) */
+  blackoutUntil?: number;
   answersByPlayerId: Map<string, number>;
   /** Timestamp when each player locked in (used for speed bonus calculation) */
   lockinTimeByPlayerId: Map<string, number>;
@@ -142,8 +170,19 @@ type PublicRoomState = {
     startedAt: number;
     endsAt: number;
     revealAt: number;
+    blackoutUntil?: number;
     locked: boolean;
     revealedAnswerIndex?: number;
+  };
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    noDecreases: boolean;
+    category?: string;
+    hint?: string;
+    totalWagered: number;
   };
   shop?: { open: boolean; items: ShopItem[] };
   boss?: BossState;
@@ -176,6 +215,16 @@ type HostRoomState = {
     heartsAtRisk: boolean;
   };
   availableActs?: ActId[];
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    noDecreases: boolean;
+    category?: string;
+    hint?: string;
+    totalWagered: number;
+  };
   /** If set, a player is requesting to be revived and host must approve/decline */
   pendingRevive?: ReviveRequest;
 };
@@ -195,6 +244,8 @@ type PlayerRevealPayload = {
   heartsAtRisk?: boolean;
   /** Speed bonus points earned (0 if not locked in or wrong) */
   speedBonus?: number;
+  /** Wager amount (only for wager_round) */
+  wagered?: number;
 };
 
 type ItemUseAckData =
@@ -209,8 +260,6 @@ const nextApp = next({ dev });
 const handle = nextApp.getRequestHandler();
 
 const makeCode = customAlphabet('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 5);
-
-const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 30);
 
 const DEFAULT_CONFIG: RoomConfig = {
   maxLives: 3,
@@ -266,6 +315,26 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
     availableShopItems: ['fifty_fifty', 'freeze_time', 'double_points', 'shield', 'buyback_token'],
     speedBonusMax: 40,
   },
+  wager_round: {
+    id: 'wager_round',
+    name: 'High Stakes',
+    emoji: '🎰',
+    description:
+      'Everyone still alive can wager points. Get it right: win your wager. Get it wrong: lose it.',
+    // High Stakes should feel dramatic: significantly more thinking time.
+    // Requested: ~1 minute or more for the High Stakes question.
+    questionDurationMs: 75_000,
+    // No hearts at risk — this round is about points
+    heartsAtRisk: false,
+    heartsOnlyOnHard: false,
+    // No coin rewards here — keep the focus on score swings
+    coinRewardBase: 0,
+    // Score multiplier does not apply — wager is handled specially
+    scoreMultiplier: 1.0,
+    // No shop items during High Stakes
+    availableShopItems: [],
+    speedBonusMax: 0,
+  },
   boss_fight: {
     id: 'boss_fight',
     name: 'Boss Fight',
@@ -282,7 +351,7 @@ const ACT_CONFIGS: Record<ActId, ActConfig> = {
   },
 };
 
-const ACT_ORDER: ActId[] = ['homeroom', 'pop_quiz', 'field_trip', 'boss_fight'];
+const ACT_ORDER: ActId[] = ['homeroom', 'pop_quiz', 'field_trip', 'wager_round', 'boss_fight'];
 
 /* ────────────────────── Question Bank (per act) ────────────────────── */
 
@@ -343,6 +412,26 @@ type ActState = {
   questionIndex: number;
 };
 
+type WagerState = {
+  questionId: string;
+  startedAt: number;
+  endsAt: number;
+  stage: WagerStage;
+  locked: boolean;
+  wagersByPlayerId: Map<string, number>;
+  /** Per-player 50/50 perk (generated once when wagers lock) */
+  removedIndexesByPlayerId: Map<string, number[]>;
+  /** Timers for the redline timeline */
+  stageTimers?: {
+    category?: ReturnType<typeof setTimeout>;
+    hint?: ReturnType<typeof setTimeout>;
+    redline?: ReturnType<typeof setTimeout>;
+    closing?: ReturnType<typeof setTimeout>;
+    lock?: ReturnType<typeof setTimeout>;
+    postLock?: ReturnType<typeof setTimeout>;
+  };
+};
+
 type Room = {
   code: string;
   createdAt: number;
@@ -357,6 +446,9 @@ type Room = {
 
   /** The current act state — null only during lobby */
   actState: ActState | null;
+
+  /** Wager mini-round state (used only during wager_round act) */
+  wagerState?: WagerState;
 
   /** Legacy fields kept for boss mode compatibility */
   questionDeck: Question[];
@@ -397,6 +489,17 @@ function destroyRoom(code: string) {
   if (room.countdownTimer) {
     clearTimeout(room.countdownTimer);
     room.countdownTimer = undefined;
+  }
+
+  // Clear wager timers
+  if (room.wagerState?.stageTimers) {
+    for (const key of Object.keys(room.wagerState.stageTimers) as (keyof NonNullable<
+      WagerState['stageTimers']
+    >)[]) {
+      const t = room.wagerState.stageTimers[key];
+      if (t) clearTimeout(t);
+    }
+    room.wagerState.stageTimers = {};
   }
 
   // Clean up reverse lookup for all sockets in this room
@@ -486,6 +589,10 @@ function toPublicPlayer(p: Player): PublicPlayer {
 
     inventory: inv,
 
+    wager: p.wager,
+    wagerSubmitted: p.wagerSubmitted,
+    wagerSwapUsed: p.wagerSwapUsed,
+
     buffs: {
       doublePoints: (inv.double_points ?? 0) > 0,
       shield: (inv.shield ?? 0) > 0,
@@ -565,6 +672,7 @@ function toPublicQuestion(q: Question): PublicQuestion {
     id: q.id,
     category: q.category,
     prompt: q.prompt,
+    hint: q.hint,
     choices: q.choices,
     value: q.value,
     hard: q.hard,
@@ -615,6 +723,10 @@ function roomToPublic(room: Room): PublicRoomState {
     .sort((a, b) => a.joinedAt - b.joinedAt);
 
   const q = getCurrentQuestion(room);
+  const wagerQ =
+    room.wagerState && room.actState
+      ? room.actState.questions.find((qq) => qq.id === room.wagerState?.questionId)
+      : undefined;
 
   const actInfo = room.actState
     ? {
@@ -644,8 +756,29 @@ function roomToPublic(room: Room): PublicRoomState {
             endsAt: room.currentQuestion.endsAt,
             locked: room.currentQuestion.locked,
             revealAt: computeRevealAt(room),
+            blackoutUntil: room.currentQuestion.blackoutUntil,
             revealedAnswerIndex: room.currentQuestion.locked ? q.answerIndex : undefined,
           }
+        : undefined,
+    wager:
+      room.wagerState && wagerQ
+        ? (() => {
+            const stage = room.wagerState!.stage;
+            const idx = wagerStageIndex(stage);
+            return {
+              open: room.phase === 'wager' && !room.wagerState!.locked,
+              endsAt: room.wagerState!.endsAt,
+              locked: room.wagerState!.locked,
+              stage,
+              noDecreases: idx >= 3,
+              category: idx >= 1 ? wagerQ.category : undefined,
+              hint: idx >= 2 ? wagerQ.hint : undefined,
+              totalWagered: Array.from(room.wagerState!.wagersByPlayerId.values()).reduce(
+                (sum, v) => sum + v,
+                0
+              ),
+            };
+          })()
         : undefined,
     shop: {
       open: room.shopOpen,
@@ -673,6 +806,10 @@ function getAvailableActs(room: Room): ActId[] {
 
 function roomToHost(room: Room): HostRoomState {
   const q = getCurrentQuestion(room);
+  const wagerQ =
+    room.wagerState && room.actState
+      ? room.actState.questions.find((qq) => qq.id === room.wagerState?.questionId)
+      : undefined;
   return {
     code: room.code,
     phase: room.phase,
@@ -691,6 +828,26 @@ function roomToHost(room: Room): HostRoomState {
         }
       : undefined,
     availableActs: getAvailableActs(room),
+    wager:
+      room.wagerState && wagerQ
+        ? (() => {
+            const stage = room.wagerState!.stage;
+            const idx = wagerStageIndex(stage);
+            return {
+              open: room.phase === 'wager' && !room.wagerState!.locked,
+              endsAt: room.wagerState!.endsAt,
+              locked: room.wagerState!.locked,
+              stage,
+              noDecreases: idx >= 3,
+              category: wagerQ.category,
+              hint: wagerQ.hint,
+              totalWagered: Array.from(room.wagerState!.wagersByPlayerId.values()).reduce(
+                (sum, v) => sum + v,
+                0
+              ),
+            };
+          })()
+        : undefined,
     pendingRevive: room.pendingRevive,
   };
 }
@@ -734,9 +891,14 @@ function nextQuestion(room: Room): Question | null {
   return q;
 }
 
-function startQuestion(room: Room, q: Question, io: Server) {
+function startQuestion(
+  room: Room,
+  q: Question,
+  io: Server,
+  opts?: { durationOverrideMs?: number; blackoutUntil?: number }
+) {
   const now = Date.now();
-  const durationMs = getQuestionDurationMs(room);
+  const durationMs = opts?.durationOverrideMs ?? getQuestionDurationMs(room);
   const countdownMs = room.config.countdownMs;
   const countdownEndsAt = now + countdownMs;
 
@@ -758,6 +920,7 @@ function startQuestion(room: Room, q: Question, io: Server) {
     countdownEndsAt,
     startedAt: countdownEndsAt, // timer starts when countdown ends
     endsAt: countdownEndsAt + durationMs,
+    blackoutUntil: opts?.blackoutUntil,
     answersByPlayerId: new Map(),
     lockinTimeByPlayerId: new Map(),
     freezeBonus: new Map(),
@@ -778,10 +941,254 @@ function startQuestion(room: Room, q: Question, io: Server) {
   }, countdownMs);
 }
 
+function wagerStageIndex(stage: WagerStage): number {
+  switch (stage) {
+    case 'blind':
+      return 0;
+    case 'category':
+      return 1;
+    case 'hint':
+      return 2;
+    case 'redline':
+      return 3;
+    case 'closing':
+      return 4;
+    case 'locked':
+      return 5;
+    default:
+      return 0;
+  }
+}
+
+function computeWagerTier(
+  score: number,
+  wager: number
+): { tier: WagerTier; ratio: number; index: number } {
+  const s = Math.max(0, Math.floor(score));
+  const w = Math.max(0, Math.floor(wager));
+  if (s <= 0 || w <= 0) return { tier: 'SAFE', ratio: 0, index: 0 };
+  const ratioRaw = w / s;
+  const ratio = Math.max(0, Math.min(1, ratioRaw));
+
+  if (w >= s) return { tier: 'ALL_IN', ratio: 1, index: 4 };
+  if (ratio >= 0.8) return { tier: 'INSANE', ratio, index: 3 };
+  if (ratio >= 0.5) return { tier: 'HIGH_ROLLER', ratio, index: 2 };
+  if (ratio >= 0.25) return { tier: 'BOLD', ratio, index: 1 };
+  return { tier: 'SAFE', ratio, index: 0 };
+}
+
+function clearWagerTimers(room: Room) {
+  const st = room.wagerState?.stageTimers;
+  if (!st) return;
+  for (const key of Object.keys(st) as (keyof NonNullable<WagerState['stageTimers']>)[]) {
+    const t = st[key];
+    if (t) clearTimeout(t);
+  }
+  room.wagerState!.stageTimers = {};
+}
+
+function sendWagerPerksIfNeeded(room: Room, p: Player, io: Server) {
+  if (room.actState?.actId !== 'wager_round') return;
+  const ws = room.wagerState;
+  if (!ws) return;
+  const q = room.actState?.questions.find((qq) => qq.id === ws.questionId);
+  if (!q) return;
+
+  // Extra hint unlocks at REDLINE for Bold+
+  if (room.phase === 'wager' && wagerStageIndex(ws.stage) >= 3 && !p.eliminated) {
+    const w = ws.wagersByPlayerId.get(p.playerId) ?? p.wager ?? 0;
+    const tier = computeWagerTier(p.score, w);
+    if (tier.index >= 1) {
+      const text = (
+        q.extraHint && q.extraHint.trim().length > 0
+          ? q.extraHint.trim()
+          : 'Trust your logic — eliminate what cannot be true.'
+      ) as string;
+      io.to(p.socketId).emit('wager:extra_hint', { text });
+    }
+  }
+
+  // 50/50 perk for High Roller+ (generated when wagers lock)
+  if (room.currentQuestion && room.currentQuestion.questionId === ws.questionId) {
+    const removed = ws.removedIndexesByPlayerId.get(p.playerId);
+    if (removed && removed.length > 0) {
+      io.to(p.socketId).emit('wager:fifty_fifty', { removedIndexes: removed });
+    }
+  }
+}
+
+function startWager(room: Room, q: Question, io: Server) {
+  const now = Date.now();
+  // Requested: ~1 minute to choose wager.
+  const wagerMs = 60_000;
+
+  // Redline timeline beats (ms after start)
+  const categoryOffset = 15_000; // 45s left
+  const hintOffset = 30_000; // 30s left
+  const redlineOffset = 45_000; // 15s left (NO DECREASES)
+  const closingOffset = 55_000; // 5s left (siren)
+
+  // Reset per-player wager state
+  for (const p of room.playersById.values()) {
+    p.wager = undefined;
+    p.wagerSubmitted = false;
+    p.wagerSwapUsed = undefined;
+  }
+
+  // Clear any old wager timers
+  if (room.wagerState?.stageTimers) clearWagerTimers(room);
+
+  room.phase = 'wager';
+  room.currentQuestion = undefined;
+  room.shopOpen = false;
+
+  room.wagerState = {
+    questionId: q.id,
+    startedAt: now,
+    endsAt: now + wagerMs,
+    stage: 'blind',
+    locked: false,
+    wagersByPlayerId: new Map(),
+    removedIndexesByPlayerId: new Map(),
+    stageTimers: {},
+  };
+
+  const ws = room.wagerState;
+
+  ws.stageTimers!.category = setTimeout(() => {
+    if (!room.wagerState || room.wagerState.questionId !== q.id) return;
+    if (room.wagerState.locked) return;
+    room.wagerState.stage = 'category';
+    broadcastRoom(io, room);
+  }, categoryOffset);
+
+  ws.stageTimers!.hint = setTimeout(() => {
+    if (!room.wagerState || room.wagerState.questionId !== q.id) return;
+    if (room.wagerState.locked) return;
+    room.wagerState.stage = 'hint';
+    broadcastRoom(io, room);
+  }, hintOffset);
+
+  ws.stageTimers!.redline = setTimeout(() => {
+    if (!room.wagerState || room.wagerState.questionId !== q.id) return;
+    if (room.wagerState.locked) return;
+    room.wagerState.stage = 'redline';
+
+    // Unlock extra hint for Bold+ immediately (private per player)
+    for (const p of room.playersById.values()) {
+      if (!p.connected || p.eliminated) continue;
+      sendWagerPerksIfNeeded(room, p, io);
+    }
+
+    broadcastRoom(io, room);
+  }, redlineOffset);
+
+  ws.stageTimers!.closing = setTimeout(() => {
+    if (!room.wagerState || room.wagerState.questionId !== q.id) return;
+    if (room.wagerState.locked) return;
+    room.wagerState.stage = 'closing';
+    io.to(room.code).emit('wager:siren');
+    broadcastRoom(io, room);
+  }, closingOffset);
+
+  ws.stageTimers!.lock = setTimeout(() => {
+    lockWagers(room, io);
+  }, wagerMs);
+
+  logger.info({ code: room.code }, '🎰 wager phase started (redline)');
+}
+
+function lockWagers(room: Room, io: Server) {
+  const ws = room.wagerState;
+  if (!ws) return;
+  if (ws.locked) return;
+  const q = room.actState?.questions.find((qq) => qq.id === ws.questionId);
+  if (!q) return;
+
+  ws.locked = true;
+  ws.stage = 'locked';
+
+  // Stop timeline timers
+  if (ws.stageTimers) {
+    for (const key of Object.keys(ws.stageTimers) as (keyof NonNullable<
+      WagerState['stageTimers']
+    >)[]) {
+      const t = ws.stageTimers[key];
+      if (t) clearTimeout(t);
+    }
+    ws.stageTimers = {};
+  }
+
+  // Compute spotlight + perks
+  const alive = Array.from(room.playersById.values()).filter((p) => !p.eliminated);
+  const entries: WagerSpotlightEntry[] = [];
+  let totalWagered = 0;
+  let allInCount = 0;
+  let noBetCount = 0;
+
+  for (const p of alive) {
+    const beforeScore = Math.max(0, p.score);
+    const rawW = ws.wagersByPlayerId.get(p.playerId) ?? 0;
+    const wager = Math.max(0, Math.min(Math.floor(rawW), beforeScore));
+    totalWagered += wager;
+
+    if (wager <= 0) noBetCount++;
+
+    const tier = computeWagerTier(beforeScore, wager);
+    if (tier.tier === 'ALL_IN') allInCount++;
+
+    if (wager > 0) {
+      entries.push({
+        playerId: p.playerId,
+        name: p.name,
+        wager,
+        score: beforeScore,
+        ratio: tier.ratio,
+        tier: tier.tier,
+      });
+    }
+
+    // Reset swap for upcoming question
+    p.wagerSwapUsed = false;
+
+    // Pre-generate 50/50 perk for High Roller+ (stored so reconnects get same removal)
+    if (tier.index >= 2) {
+      const wrong = q.choices.map((_, idx) => idx).filter((idx) => idx !== q.answerIndex);
+      const removed = shuffle(wrong).slice(0, 2);
+      ws.removedIndexesByPlayerId.set(p.playerId, removed);
+    }
+  }
+
+  // Biggest bet / top risk takers
+  const sorted = [...entries].sort((a, b) => {
+    if (b.ratio !== a.ratio) return b.ratio - a.ratio;
+    return b.wager - a.wager;
+  });
+
+  const spotlight: WagerSpotlightPayload = {
+    totalWagered,
+    allInCount,
+    noBetCount,
+    biggest: sorted[0],
+    topRisk: sorted.slice(0, 3),
+  };
+
+  io.to(room.code).emit('wager:spotlight', spotlight);
+  broadcastRoom(io, room);
+
+  // ✅ Host-controlled: the spotlight stays up until the host triggers wager:spotlight_end.
+  // The wager question will start when the host ends the spotlight.
+}
+
 /** Start a new act: loads its questions and resets act-level state */
 function startAct(room: Room, actId: ActId) {
   const config = ACT_CONFIGS[actId];
-  const questions = shuffle(getActQuestions(room, actId));
+  let questions = shuffle(getActQuestions(room, actId));
+
+  // High Stakes is a single dramatic round before the boss
+  if (actId === 'wager_round' && questions.length > 1) {
+    questions = questions.slice(0, 1);
+  }
 
   room.actState = {
     actId,
@@ -814,7 +1221,8 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
   room.currentQuestion.locked = true;
   room.phase = 'reveal';
 
-  const heartsAtRisk = doesQuestionCostHearts(room, q);
+  const isWagerRound = room.actState?.actId === 'wager_round';
+  const heartsAtRisk = isWagerRound ? false : doesQuestionCostHearts(room, q);
   const actConfig = room.actState?.config;
   const scoreMultiplier = actConfig?.scoreMultiplier ?? 1.0;
   const coinRewardBase = actConfig?.coinRewardBase ?? Math.floor(q.value / 2);
@@ -839,6 +1247,28 @@ function revealAndScore(room: Room): Map<string, PlayerRevealPayload> {
     let speedBonus = 0;
 
     if (!wasEliminated) {
+      // ───────────────── Wager Round Scoring ─────────────────
+      if (isWagerRound && room.wagerState) {
+        const rawWager = room.wagerState.wagersByPlayerId.get(p.playerId) ?? 0;
+        const wager = Math.max(0, Math.min(Math.floor(rawWager), beforeScore));
+        const scoreDelta = correct ? wager : -wager;
+        p.score = Math.max(0, p.score + scoreDelta);
+
+        results.set(p.playerId, {
+          questionId: q.id,
+          correctAnswerIndex: q.answerIndex,
+          yourAnswerIndex: answered ? (ans as number) : null,
+          correct: !!correct,
+          scoreDelta: p.score - beforeScore,
+          coinsDelta: 0,
+          livesDelta: 0,
+          eliminated: p.eliminated,
+          heartsAtRisk: false,
+          wagered: wager || undefined,
+        });
+        continue;
+      }
+
       if (correct) {
         // ── Speed Bonus (only if locked in) ──
         const lockinTime = room.currentQuestion.lockinTimeByPlayerId.get(p.playerId);
@@ -1062,18 +1492,8 @@ async function main() {
 
           const room = requireRoom(code);
 
-          const existingRoom = socketToRoomCode.get(socket.id);
-          if (existingRoom && existingRoom !== code) {
-            return ack({
-              ok: false,
-              error: 'This tab is already in a different room. Refresh and try again.',
-            });
-          }
-          if (room.socketToPlayerId.has(socket.id)) {
-            return ack({ ok: false, error: 'You are already joined in this room.' });
-          }
-
           // ── Join guards ──
+          const MAX_PLAYERS = 30;
           if (room.playersById.size >= MAX_PLAYERS) {
             return ack({ ok: false, error: `Room is full (max ${MAX_PLAYERS} players).` });
           }
@@ -1144,14 +1564,6 @@ async function main() {
 
           if (hostKey) {
             requireHost(room, hostKey);
-
-            const prevHostSocketId = room.hostSocketId;
-            if (prevHostSocketId && prevHostSocketId !== socket.id) {
-              const prev = io.sockets.sockets.get(prevHostSocketId);
-              if (prev) prev.disconnect(true);
-              socketToRoomCode.delete(prevHostSocketId);
-            }
-
             room.hostSocketId = socket.id;
             socketToRoomCode.set(socket.id, code);
             socket.join(code);
@@ -1164,22 +1576,13 @@ async function main() {
           if (!playerId) return ack({ ok: false, error: 'playerId is required.' });
 
           const p = requirePlayer(room, playerId);
-
-          const prevSocketId = p.socketId;
-          if (prevSocketId && prevSocketId !== socket.id) {
-            // Prevent duplicate player sessions (two tabs) — kick the older socket
-            room.socketToPlayerId.delete(prevSocketId);
-            socketToRoomCode.delete(prevSocketId);
-            const prev = io.sockets.sockets.get(prevSocketId);
-            if (prev) prev.disconnect(true);
-          }
-
           p.socketId = socket.id;
           p.connected = true;
           room.socketToPlayerId.set(socket.id, playerId);
           socketToRoomCode.set(socket.id, code);
           socket.join(code);
           touchRoom(room);
+          sendWagerPerksIfNeeded(room, p, io);
 
           ack({ ok: true, data: { room: roomToPublic(room), isHost: false } });
           broadcastRoom(io, room);
@@ -1281,10 +1684,26 @@ async function main() {
 
           startAct(room, actId);
 
+          // Boss Fight needs boss state so the room enters 'boss' phase
+          if (actId === 'boss_fight') {
+            room.boss = {
+              hp: room.config.bossHp,
+              maxHp: room.config.bossHp,
+              questionIds: room.actState!.questions.map((qq) => qq.id),
+              startedAt: Date.now(),
+            };
+          } else {
+            room.boss = undefined;
+          }
+
           // Auto-start the first question
           const q = nextQuestion(room);
           if (!q) throw new Error('No questions available for this act.');
-          startQuestion(room, q, io);
+          if (actId === 'wager_round') {
+            startWager(room, q, io);
+          } else {
+            startQuestion(room, q, io);
+          }
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -1325,9 +1744,51 @@ async function main() {
       }
     );
 
-    /* ── Game: End (host force-ends and shows results) ── */
+    /* ── Wager: Set (players place/change wager) ── */
     socket.on(
-      'game:end',
+      'wager:set',
+      (
+        payload: { code: string; playerId: string; amount: number },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          const p = requirePlayer(room, (payload?.playerId || '').trim());
+          const amount = Number(payload?.amount);
+
+          if (room.phase !== 'wager' || !room.wagerState || room.wagerState.locked) {
+            throw new Error('Wagers are not open.');
+          }
+          if (Date.now() > room.wagerState.endsAt) throw new Error('Wager time is up.');
+          if (p.eliminated) throw new Error('You are eliminated.');
+
+          let wager =
+            Number.isFinite(amount) && amount > 0
+              ? Math.min(Math.floor(amount), Math.max(0, p.score))
+              : 0;
+
+          // REDLINE: once we hit redline/closing, wagers can only increase or hold.
+          const prev = room.wagerState.wagersByPlayerId.get(p.playerId) ?? 0;
+          if (wagerStageIndex(room.wagerState.stage) >= 3 && wager < prev) {
+            wager = prev;
+          }
+
+          room.wagerState.wagersByPlayerId.set(p.playerId, wager);
+          p.wager = wager;
+          p.wagerSubmitted = true;
+
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+          broadcastRoom(io, room);
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+
+    /* ── Wager: Lock (host can lock wagers early) ── */
+    socket.on(
+      'wager:lock',
       (
         payload: { code: string; hostKey: string },
         ack: (res: Ack<{ room: PublicRoomState }>) => void
@@ -1337,15 +1798,45 @@ async function main() {
           const room = requireRoom(code);
           requireHost(room, (payload?.hostKey || '').trim());
 
-          // Stop any pending countdown→question transition
-          if (room.countdownTimer) {
-            clearTimeout(room.countdownTimer);
-            room.countdownTimer = undefined;
-          }
+          if (room.phase !== 'wager' || !room.wagerState) throw new Error('Not in wager phase.');
+          lockWagers(room, io);
 
-          room.shopOpen = false;
-          room.currentQuestion = undefined;
-          room.phase = 'ended';
+          ack({ ok: true, data: { room: roomToPublic(room) } });
+        } catch (e) {
+          ack({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
+        }
+      }
+    );
+    /* ── Wager: Spotlight End (host controls when the spotlight finishes) ── */
+    socket.on(
+      'wager:spotlight_end',
+      (
+        payload: { code: string; hostKey: string },
+        ack: (res: Ack<{ room: PublicRoomState }>) => void
+      ) => {
+        try {
+          const code = (payload?.code || '').trim().toUpperCase();
+          const room = requireRoom(code);
+          requireHost(room, (payload?.hostKey || '').trim());
+
+          const ws = room.wagerState;
+          if (room.phase !== 'wager' || !ws) throw new Error('Not in wager spotlight.');
+          if (!ws.locked || ws.stage !== 'locked') throw new Error('Spotlight is not active.');
+          if (room.currentQuestion) throw new Error('Wager question already started.');
+
+          const q = room.actState?.questions.find((qq) => qq.id === ws.questionId);
+          if (!q) throw new Error('Wager question not found.');
+
+          // Start the wager question with the act's longer timer
+          startQuestion(room, q, io, {
+            durationOverrideMs: ACT_CONFIGS.wager_round.questionDurationMs,
+          });
+
+          // Deliver per-player perks (50/50, extra hint if applicable) now that the question exists
+          for (const p of room.playersById.values()) {
+            if (!p.connected) continue;
+            sendWagerPerksIfNeeded(room, p, io);
+          }
 
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
@@ -1407,6 +1898,13 @@ async function main() {
 
           room.currentQuestion = undefined;
           room.shopOpen = false;
+          // Clear wager state between questions
+          room.wagerState = undefined;
+          for (const p of room.playersById.values()) {
+            p.wager = undefined;
+            p.wagerSubmitted = false;
+            p.wagerSwapUsed = undefined;
+          }
 
           if (room.boss && room.boss.hp <= 0) {
             room.phase = 'ended';
@@ -1417,29 +1915,25 @@ async function main() {
 
           const q = nextQuestion(room);
           if (!q) {
-            // Act finished. If this was the final act, end the game; otherwise go to intermission.
+            // Act is finished — go to intermission so host can open shop or start next act
             if (room.actState) {
-              const currentIdx = ACT_ORDER.indexOf(room.actState.actId);
-              const isFinalAct = currentIdx === ACT_ORDER.length - 1;
-
-              room.phase = isFinalAct ? 'ended' : 'intermission';
-
-              logger.info(
-                `  🏁 ${isFinalAct ? 'Final act' : 'Act'} "${room.actState.config.name}" finished in room ${room.code}`
-              );
-
+              room.phase = 'intermission';
+              logger.info(`  🏁 Act "${room.actState.config.name}" finished in room ${room.code}`);
               ack({ ok: true, data: { room: roomToPublic(room) } });
               broadcastRoom(io, room);
               return;
             }
-
             room.phase = 'ended';
             ack({ ok: true, data: { room: roomToPublic(room) } });
             broadcastRoom(io, room);
             return;
           }
 
-          startQuestion(room, q, io);
+          if (room.actState?.actId === 'wager_round') {
+            startWager(room, q, io);
+          } else {
+            startQuestion(room, q, io);
+          }
           ack({ ok: true, data: { room: roomToPublic(room) } });
           broadcastRoom(io, room);
         } catch (e) {
@@ -1553,12 +2047,22 @@ async function main() {
             throw new Error('Active items can only be used during a question.');
           }
 
+          if (room.actState?.actId === 'wager_round') {
+            throw new Error('No items during High Stakes.');
+          }
+
           const q = getCurrentQuestion(room);
           if (!q || !room.currentQuestion) throw new Error('No active question.');
 
           if (room.currentQuestion.locked) throw new Error('Question is locked.');
           if (p.eliminated) throw new Error('You are eliminated.');
-          if (p.lockedIn) throw new Error('Answer locked in.');
+          const isWagerRound = (room.actState?.actId as string) === 'wager_round';
+          const ws = room.wagerState;
+          const rawWager = ws ? (ws.wagersByPlayerId.get(p.playerId) ?? p.wager ?? 0) : 0;
+          const tier = computeWagerTier(p.score, rawWager);
+          const canFinalSwap =
+            isWagerRound && tier.tier === 'ALL_IN' && p.lockedIn && !p.wagerSwapUsed;
+          if (p.lockedIn && !canFinalSwap) throw new Error('Answer locked in.');
 
           const bonusMs = room.currentQuestion.freezeBonus.get(p.playerId) || 0;
           const playerEndsAt = room.currentQuestion.endsAt + bonusMs;
@@ -1615,6 +2119,13 @@ async function main() {
           }
           if (room.currentQuestion.locked) throw new Error('Question is locked.');
           if (p.eliminated) throw new Error('You are eliminated.');
+          const isWagerRound = room.actState?.actId === 'wager_round';
+          const ws = room.wagerState;
+          const rawWager = ws ? (ws.wagersByPlayerId.get(p.playerId) ?? p.wager ?? 0) : 0;
+          const tier = computeWagerTier(p.score, rawWager);
+          const canFinalSwap =
+            isWagerRound && tier.tier === 'ALL_IN' && p.lockedIn && !p.wagerSwapUsed;
+          if (p.lockedIn && !canFinalSwap) throw new Error('Answer locked in.');
 
           const q = getCurrentQuestion(room);
           if (!q) throw new Error('Question not found.');
@@ -1629,6 +2140,12 @@ async function main() {
           }
 
           room.currentQuestion.answersByPlayerId.set(p.playerId, answerIndex);
+
+          // High Stakes perk: ALL IN gets one final swap after lock-in
+          if (canFinalSwap) {
+            p.wagerSwapUsed = true;
+            logger.info(`  🔁 ${p.name} used Final Swap (${room.code})`);
+          }
 
           ack({ ok: true, data: { accepted: true } });
           broadcastRoom(io, room);
@@ -1884,8 +2401,8 @@ async function main() {
       }
 
       maybeForceCloseIfAllLocked(room);
-      maybeEnd(room);
       broadcastRoom(io, room);
+      maybeEnd(room);
     });
   });
 

@@ -14,6 +14,7 @@
  *     "homeroom": [ { category, prompt, choices, answerIndex, value, hard? } ],
  *     "pop_quiz": [...],
  *     "field_trip": [...],
+ *     "wager_round": [...],
  *     "boss_fight": [...]
  *   }
  * }
@@ -29,13 +30,15 @@ import path from 'path';
 
 /* ── Types ── */
 
-const VALID_ACT_IDS = ['homeroom', 'pop_quiz', 'field_trip', 'boss_fight'] as const;
+const VALID_ACT_IDS = ['homeroom', 'pop_quiz', 'field_trip', 'wager_round', 'boss_fight'] as const;
 type ActId = (typeof VALID_ACT_IDS)[number];
 
 type Question = {
   id: string;
   category: string;
   prompt: string;
+  hint?: string;
+  extraHint?: string;
   choices: string[];
   answerIndex: number;
   value: number;
@@ -45,6 +48,8 @@ type Question = {
 type RawQuestion = {
   category?: unknown;
   prompt?: unknown;
+  hint?: unknown;
+  extraHint?: unknown;
   choices?: unknown;
   answerIndex?: unknown;
   value?: unknown;
@@ -83,6 +88,15 @@ function validateQuestion(
   if (typeof raw.prompt !== 'string' || raw.prompt.trim().length === 0) {
     return `${prefix}: "prompt" must be a non-empty string`;
   }
+  if (raw.hint !== undefined && (typeof raw.hint !== 'string' || raw.hint.trim().length === 0)) {
+    return `${prefix}: "hint" must be a non-empty string if present`;
+  }
+  if (
+    raw.extraHint !== undefined &&
+    (typeof raw.extraHint !== 'string' || raw.extraHint.trim().length === 0)
+  ) {
+    return `${prefix}: "extraHint" must be a non-empty string if present`;
+  }
   if (!Array.isArray(raw.choices) || raw.choices.length < 2 || raw.choices.length > 6) {
     return `${prefix}: "choices" must be an array of 2-6 strings`;
   }
@@ -120,7 +134,6 @@ const packs = new Map<string, QuestionPack>();
  */
 export function loadQuestionPacks(): number {
   packs.clear();
-  console.log(PACKS_DIR);
 
   if (!fs.existsSync(PACKS_DIR)) {
     logger.warn({ dir: PACKS_DIR }, 'Question packs directory not found — no packs loaded');
@@ -186,6 +199,15 @@ export function loadQuestionPacks(): number {
             id: `${packId}_${actId}_${i}`,
             category: (rawQuestions[i].category as string).trim(),
             prompt: (rawQuestions[i].prompt as string).trim(),
+            hint:
+              typeof rawQuestions[i].hint === 'string' && rawQuestions[i].hint.trim().length > 0
+                ? (rawQuestions[i].hint as string).trim()
+                : undefined,
+            extraHint:
+              typeof rawQuestions[i].extraHint === 'string' &&
+              rawQuestions[i].extraHint.trim().length > 0
+                ? (rawQuestions[i].extraHint as string).trim()
+                : undefined,
             choices: (rawQuestions[i].choices as string[]).map((c: string) => c.trim()),
             answerIndex: rawQuestions[i].answerIndex as number,
             value: rawQuestions[i].value as number,

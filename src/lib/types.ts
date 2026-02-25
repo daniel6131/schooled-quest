@@ -8,6 +8,7 @@ export type JsonValue =
 
 export type Phase =
   | 'lobby'
+  | 'wager'
   | 'countdown'
   | 'question'
   | 'reveal'
@@ -16,7 +17,28 @@ export type Phase =
   | 'intermission'
   | 'ended';
 
-export type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'boss_fight';
+export type ActId = 'homeroom' | 'pop_quiz' | 'field_trip' | 'wager_round' | 'boss_fight';
+
+export type WagerStage = 'blind' | 'category' | 'hint' | 'redline' | 'closing' | 'locked';
+
+export type WagerTier = 'SAFE' | 'BOLD' | 'HIGH_ROLLER' | 'INSANE' | 'ALL_IN';
+
+export type WagerSpotlightEntry = {
+  playerId: string;
+  name: string;
+  wager: number;
+  score: number;
+  ratio: number;
+  tier: WagerTier;
+};
+
+export type WagerSpotlightPayload = {
+  totalWagered: number;
+  allInCount: number;
+  noBetCount: number;
+  biggest?: WagerSpotlightEntry;
+  topRisk: WagerSpotlightEntry[];
+};
 
 export type ActConfig = {
   id: ActId;
@@ -56,6 +78,13 @@ export type Player = {
 
   inventory: Record<string, number>;
 
+  /** Wager round state (only meaningful during wager_round act) */
+  wager?: number;
+  wagerSubmitted?: boolean;
+
+  /** All-in perk: whether you've already used your one-time final swap this question */
+  wagerSwapUsed?: boolean;
+
   /** Passive buffs currently active — shown as indicators on the player's HUD */
   buffs: {
     doublePoints?: boolean;
@@ -67,6 +96,8 @@ export type PublicQuestion = {
   id: string;
   category: string;
   prompt: string;
+  /** Optional hint (used by wager_round pre-bet screen) */
+  hint?: string;
   choices: string[];
   value: number;
   /** Whether this question is tagged as "hard" (affects heart loss in some acts) */
@@ -129,9 +160,26 @@ export type PublicRoomState = {
     endsAt: number;
     /** When the host is allowed to reveal (accounts for Freeze Time + early end). */
     revealAt: number;
+    /** If set, choices are hidden/disabled until this timestamp (wager_round twist) */
+    blackoutUntil?: number;
     locked: boolean;
     /** Present only after host reveals. */
     revealedAnswerIndex?: number;
+  };
+
+  /** Wager mini-round (appears before the wager question countdown) */
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    /** True during/after REDLINE: wagers cannot be decreased */
+    noDecreases: boolean;
+    /** Category is revealed partway through the redline timeline */
+    category?: string;
+    /** Hint is revealed partway through the redline timeline */
+    hint?: string;
+    totalWagered: number;
   };
   shop?: {
     open: boolean;
@@ -177,6 +225,18 @@ export type HostRoomState = {
   };
   /** Available acts the host can advance to */
   availableActs?: ActId[];
+  /** Wager state (host view) */
+  wager?: {
+    open: boolean;
+    endsAt: number;
+    locked: boolean;
+    stage: WagerStage;
+    noDecreases: boolean;
+    /** Host always sees category/hint once available in the pack */
+    category?: string;
+    hint?: string;
+    totalWagered: number;
+  };
   /** If set, a player is requesting to be revived and host must approve/decline */
   pendingRevive?: ReviveRequest;
 };
@@ -197,6 +257,9 @@ export type PlayerRevealPayload = {
   heartsAtRisk?: boolean;
   /** Speed bonus points earned (0 if not locked in or wrong) */
   speedBonus?: number;
+
+  /** Wager amount (only for wager_round) */
+  wagered?: number;
 };
 
 export type Ack<T> = { ok: true; data: T } | { ok: false; error: string };

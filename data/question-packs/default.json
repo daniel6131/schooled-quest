@@ -23,7 +23,6 @@
         "value": 100
       }
     ],
-
     "pop_quiz": [
       {
         "id": "pq01",
@@ -85,7 +84,6 @@
         "hard": true
       }
     ],
-
     "field_trip": [
       {
         "id": "ft01",
@@ -136,7 +134,82 @@
         "value": 250
       }
     ],
-
+    "wager_round": [
+      {
+        "id": "wr01",
+        "category": "Logic",
+        "hint": "Only ONE option can be true \u2014 but more than one can sound right.",
+        "prompt": "A jar has 3 red, 2 blue, and 1 green marble. You draw 2 marbles without replacement. Which outcome is MOST likely?",
+        "choices": ["Two red", "One red and one blue", "Two blue", "One green and one red"],
+        "answerIndex": 1,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Count combinations: total pairs = C(6,2). Compare how many pairs match each option."
+      },
+      {
+        "id": "wr02",
+        "category": "Math",
+        "hint": "Think about what changes (and what doesn\u2019t) when you add the same number twice.",
+        "prompt": "If x is an integer and 2x + 1 is even, which must be true?",
+        "choices": ["x is even", "x is odd", "x is prime", "No such integer x exists"],
+        "answerIndex": 3,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Parity check: 2x is always even, so 2x+1 is always odd."
+      },
+      {
+        "id": "wr03",
+        "category": "Science",
+        "hint": "One option is a common misconception.",
+        "prompt": "Which statement about seasons on Earth is correct?",
+        "choices": [
+          "Seasons happen because Earth is closer to the Sun in summer",
+          "Seasons happen mainly because of Earth\u2019s tilt",
+          "Seasons happen because the Sun\u2019s heat output changes each month",
+          "Seasons only happen in the Northern Hemisphere"
+        ],
+        "answerIndex": 1,
+        "value": 250,
+        "extraHint": "Seasons come from the angle of sunlight and day length changes over the year."
+      },
+      {
+        "id": "wr04",
+        "category": "Probability",
+        "hint": "Independence matters here.",
+        "prompt": "You flip a fair coin 4 times. What is the probability of getting exactly 2 heads?",
+        "choices": ["1/4", "3/8", "1/2", "5/8"],
+        "answerIndex": 1,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Use the binomial count: C(4,2) ways to place 2 heads, each sequence has probability (1/2)^4."
+      },
+      {
+        "id": "wr05",
+        "category": "Words",
+        "hint": "Read carefully: it\u2019s about what MUST be true, not what is likely.",
+        "prompt": "If all Blips are Blops, and some Blops are Blaps, which must be true?",
+        "choices": [
+          "Some Blips are Blaps",
+          "All Blops are Blips",
+          "Some Blaps are Blops",
+          "No Blips are Blaps"
+        ],
+        "answerIndex": 2,
+        "value": 250,
+        "hard": true,
+        "extraHint": "Translate carefully: \u201csome Blops are Blaps\u201d means at least one Blap is also a Blop."
+      },
+      {
+        "id": "wr06",
+        "category": "Tech",
+        "hint": "Two of these look similar, but only one is truly a protocol.",
+        "prompt": "Which of these is a network protocol (not a programming language or platform)?",
+        "choices": ["Python", "HTTP", "React", "Node.js"],
+        "answerIndex": 1,
+        "value": 250,
+        "extraHint": "A protocol is a set of communication rules (often like HTTP/FTP), not a language/framework/runtime."
+      }
+    ],
     "boss_fight": [
       {
         "id": "bf01",
