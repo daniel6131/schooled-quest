@@ -1,5 +1,14 @@
 'use client';
 
+import {
+  ActBanner,
+  BossBar,
+  PhaseChip,
+  PlayerRow,
+  TimerRing,
+  WagerStages,
+  WagerTierBadge,
+} from '@/components/game/gamePrimitives';
 import { logger } from '@/lib/logger';
 import { getSocket } from '@/lib/socket';
 import type { Ack, HostRoomState, PublicRoomState, WagerSpotlightPayload } from '@/lib/types';
@@ -17,6 +26,14 @@ const ACT_META: Record<ActId, { name: string; emoji: string; color: string }> = 
   field_trip: { name: 'Field Trip', emoji: '🎒', color: 'orange' },
   wager_round: { name: 'High Stakes', emoji: '🎰', color: 'pink' },
   boss_fight: { name: 'Boss Fight', emoji: '🐉', color: 'red' },
+};
+
+const ACT_BTN_CLS: Record<string, string> = {
+  homeroom: 'host-btn-green',
+  pop_quiz: 'host-btn-amber',
+  field_trip: 'host-btn-amber',
+  wager_round: 'host-btn-pink',
+  boss_fight: 'host-btn-red',
 };
 
 function useLocalStorageItem(key: string): string | null {
@@ -50,6 +67,7 @@ export default function HostRoomClient({ code }: { code: string }) {
   const [lanUrl, setLanUrl] = useState<string | null>(null);
   const [spotlight, setSpotlight] = useState<WagerSpotlightPayload | null>(null);
   const [wagerSiren, setWagerSiren] = useState(false);
+  const [showLog, setShowLog] = useState(false);
 
   const addLog = useCallback((msg: string) => {
     setLog((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 30));
@@ -78,10 +96,7 @@ export default function HostRoomClient({ code }: { code: string }) {
     const s = getSocket();
     const onRoom = (r: PublicRoomState) => setRoom(r);
     const onHost = (h: HostRoomState) => setHostState(h);
-    const onWagerSpotlight = (p: WagerSpotlightPayload) => {
-      // Host controls when spotlight ends (no auto-dismiss)
-      setSpotlight(p);
-    };
+    const onWagerSpotlight = (p: WagerSpotlightPayload) => setSpotlight(p);
     const onWagerSiren = () => {
       setWagerSiren(true);
       setTimeout(() => setWagerSiren(false), 1200);
@@ -110,11 +125,9 @@ export default function HostRoomClient({ code }: { code: string }) {
       .catch(() => setLanUrl(null));
   }, []);
 
-  // ── Initial connect + reconnect: re-resume as host ──
   useEffect(() => {
     if (!roomCode || !hostKey) return;
     const s = getSocket();
-
     const doResume = () => {
       s.emit(
         'room:resume',
@@ -127,11 +140,7 @@ export default function HostRoomClient({ code }: { code: string }) {
         }
       );
     };
-
-    // Fire immediately if already connected
     if (s.connected) doResume();
-
-    // Also fire on every (re)connect
     const onConnect = () => {
       logger.info({ roomCode }, 'socket (re)connected, resuming room');
       doResume();
@@ -149,27 +158,21 @@ export default function HostRoomClient({ code }: { code: string }) {
   const shopOpen = room?.shop?.open ?? false;
   const currentAct = room?.currentAct;
   const availableActs = hostState?.availableActs ?? [];
-
   const activePlayers = (room?.players ?? []).filter((p) => p.connected && !p.eliminated);
   const lockedInCount = activePlayers.filter((p) => p.lockedIn).length;
   const activeCount = activePlayers.length;
   const allLockedIn = activeCount > 0 && lockedInCount === activeCount;
-
   const revealAt = q?.revealAt ?? q?.endsAt ?? 0;
   const canReveal =
     !!q && (phase === 'question' || phase === 'boss') && !q.locked && now >= revealAt;
-
   const isCountdown = phase === 'countdown';
   const countdownEndsAt = q?.countdownEndsAt ?? 0;
   const countdownMsLeft = isCountdown ? Math.max(0, countdownEndsAt - now) : 0;
   const countdownSecondsLeft = Math.ceil(countdownMsLeft / 1000);
-
   const isIntermission = phase === 'intermission';
-
   const isWager = phase === 'wager';
   const wagerEndsAt = wager?.endsAt ?? 0;
   const wagerSecondsLeft = isWager ? Math.max(0, Math.ceil((wagerEndsAt - now) / 1000)) : 0;
-
   const wagerStage = wager?.stage ?? 'blind';
   const wagerStageIndex =
     wagerStage === 'blind'
@@ -184,151 +187,157 @@ export default function HostRoomClient({ code }: { code: string }) {
               ? 4
               : 5;
   const wagerNoDecreases = wager?.noDecreases ?? false;
-
   const pendingRevive = hostState?.pendingRevive ?? null;
 
   if (!roomCode) {
     return (
-      <main className="flex min-h-full items-center justify-center p-6">
-        <div className="w-full max-w-md rounded-2xl border p-6">
-          <h1 className="text-xl font-bold">Invalid room</h1>
+      <main className="relative z-10 flex min-h-dvh items-center justify-center p-6">
+        <div className="game-card p-8">
+          <h1 className="text-lg font-bold text-white">Invalid room</h1>
         </div>
       </main>
     );
   }
 
   return (
-    <main className="min-h-full p-6">
+    <main className="relative z-10 min-h-dvh pb-8">
+      {/* ── Spotlight Modal ── */}
       {spotlight && phase === 'wager' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-          <div className="w-full max-w-lg rounded-3xl border border-pink-200 bg-white p-6 shadow-2xl">
+        <div className="game-modal-backdrop">
+          <div className="game-card w-full p-6" style={{ maxWidth: 520 }}>
             <div className="flex items-start justify-between gap-4">
               <div>
-                <div className="text-sm font-semibold text-pink-700">🎥 Spotlight (Host)</div>
-                <div className="text-2xl font-black text-pink-800">HIGH STAKES LOCKED</div>
+                <div
+                  className="text-[11px] font-bold tracking-wider uppercase"
+                  style={{ color: '#f472b6' }}
+                >
+                  🎥 Spotlight
+                </div>
+                <div
+                  className="mt-1 text-2xl font-black text-white"
+                  style={{ fontFamily: 'var(--font-display)' }}
+                >
+                  HIGH STAKES LOCKED
+                </div>
               </div>
-              <div className="rounded-xl bg-pink-50 px-3 py-2 text-right">
-                <div className="text-xs font-semibold text-pink-700">POT</div>
-                <div className="text-lg font-black text-pink-900 tabular-nums">
+              <div className="game-card-compact px-4 py-2 text-right">
+                <div className="text-[10px] font-bold" style={{ color: '#f472b6' }}>
+                  TOTAL POT
+                </div>
+                <div className="text-xl font-black text-white tabular-nums">
                   {spotlight.totalWagered}
                 </div>
               </div>
             </div>
-
             <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-              <div className="rounded-2xl border bg-neutral-50 p-3">
-                <div className="text-[11px] font-semibold text-neutral-600">ALL IN</div>
-                <div className="text-xl font-black tabular-nums">{spotlight.allInCount}</div>
-              </div>
-              <div className="rounded-2xl border bg-neutral-50 p-3">
-                <div className="text-[11px] font-semibold text-neutral-600">NO BET</div>
-                <div className="text-xl font-black tabular-nums">{spotlight.noBetCount}</div>
-              </div>
-              <div className="rounded-2xl border bg-neutral-50 p-3">
-                <div className="text-[11px] font-semibold text-neutral-600">BIGGEST</div>
-                <div className="text-sm font-black">
-                  {spotlight.biggest ? spotlight.biggest.name : '—'}
+              {[
+                { label: 'ALL IN', val: spotlight.allInCount },
+                { label: 'NO BET', val: spotlight.noBetCount },
+                { label: 'BIGGEST', val: spotlight.biggest?.name ?? '—' },
+              ].map((s) => (
+                <div key={s.label} className="game-card-compact p-3">
+                  <div className="text-[10px] font-bold" style={{ color: 'rgba(255,255,255,0.4)' }}>
+                    {s.label}
+                  </div>
+                  <div className="mt-1 text-lg font-black text-white">{s.val}</div>
                 </div>
-              </div>
+              ))}
             </div>
-
-            {spotlight.topRisk.length > 0 ? (
-              <div className="mt-4">
-                <div className="text-xs font-bold text-neutral-600">Top risk takers</div>
-                <div className="mt-2 space-y-2">
-                  {spotlight.topRisk.map((e, idx) => (
-                    <div
-                      key={e.playerId}
-                      className="flex items-center justify-between rounded-2xl border bg-white px-4 py-3"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className="text-lg font-black">#{idx + 1}</div>
-                        <div>
-                          <div className="text-sm font-bold">{e.name}</div>
-                          <div className="text-[11px] text-neutral-500">
-                            Bet {e.wager} ({Math.round(e.ratio * 100)}%)
-                          </div>
+            {spotlight.topRisk.length > 0 && (
+              <div className="mt-4 space-y-2">
+                {spotlight.topRisk.map((e, idx) => (
+                  <div
+                    key={e.playerId}
+                    className="game-card-compact flex items-center justify-between px-4 py-3"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span
+                        className="text-sm font-black"
+                        style={{ color: 'rgba(255,255,255,0.3)' }}
+                      >
+                        #{idx + 1}
+                      </span>
+                      <div>
+                        <div className="text-sm font-bold text-white">{e.name}</div>
+                        <div className="text-[11px]" style={{ color: 'rgba(255,255,255,0.4)' }}>
+                          Bet {e.wager} ({Math.round(e.ratio * 100)}%)
                         </div>
                       </div>
-                      <div className="text-sm font-black">
-                        {e.tier === 'ALL_IN'
-                          ? '🟥 ALL IN'
-                          : e.tier === 'INSANE'
-                            ? '😈 INSANE'
-                            : e.tier === 'HIGH_ROLLER'
-                              ? '🎲 HIGH ROLLER'
-                              : e.tier === 'BOLD'
-                                ? '💪 BOLD'
-                                : '🙂 SAFE'}
-                      </div>
                     </div>
-                  ))}
-                </div>
+                    <WagerTierBadge tier={e.tier} />
+                  </div>
+                ))}
               </div>
-            ) : null}
-
-            <div className="mt-5">
-              <button
-                type="button"
-                className="w-full rounded-2xl bg-pink-600 px-4 py-3 text-base font-black text-white hover:bg-pink-700"
-                onClick={() => {
-                  if (!hostKey) return addLog('❌ No hostKey');
-                  const s = getSocket();
-                  s.emit(
-                    'wager:spotlight_end',
-                    { code: roomCode, hostKey },
-                    (ack: Ack<{ room: PublicRoomState }>) => {
-                      if (!ack.ok) {
-                        setError((ack as { ok: false; error: string }).error);
-                        addLog(
-                          `❌ Start High Stakes Question: ${(ack as { ok: false; error: string }).error}`
-                        );
-                        return;
-                      }
-                      setError(null);
-                      addLog('✅ Start High Stakes Question');
-                      setSpotlight(null);
-                      setRoom((ack as { ok: true; data: { room: PublicRoomState } }).data.room);
+            )}
+            <button
+              type="button"
+              className="cta-button mt-5"
+              style={{
+                background: 'linear-gradient(135deg, #db2777, #ec4899)',
+                boxShadow: '0 0 20px rgba(236,72,153,0.3)',
+              }}
+              onClick={() => {
+                if (!hostKey) return addLog('❌ No hostKey');
+                const s = getSocket();
+                s.emit(
+                  'wager:spotlight_end',
+                  { code: roomCode, hostKey },
+                  (ack: Ack<{ room: PublicRoomState }>) => {
+                    if (!ack.ok) {
+                      setError((ack as { ok: false; error: string }).error);
+                      return;
                     }
-                  );
-                }}
-              >
-                ▶ Start High Stakes Question
-              </button>
-              <div className="mt-2 text-center text-xs font-semibold text-neutral-500">
-                Spotlight will stay up until you press Start.
-              </div>
+                    setError(null);
+                    addLog('✅ Start High Stakes Question');
+                    setSpotlight(null);
+                    setRoom((ack as { ok: true; data: { room: PublicRoomState } }).data.room);
+                  }
+                );
+              }}
+            >
+              <span className="relative z-10">▶ Start High Stakes Question</span>
+            </button>
+            <div
+              className="mt-2 text-center text-[11px]"
+              style={{ color: 'rgba(255,255,255,0.3)' }}
+            >
+              Stays up until you press Start
             </div>
           </div>
         </div>
       )}
-      {/* ── Revive Request Modal (blocks host screen until decided) ── */}
+
+      {/* ── Revive Request Modal ── */}
       {pendingRevive && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-          <div className="w-full max-w-md rounded-2xl border-2 border-emerald-400 bg-white p-8 shadow-2xl">
-            <div className="text-center">
-              <div className="text-5xl">🙏</div>
-              <h2 className="mt-4 text-2xl font-bold text-emerald-800">Revive Shrine</h2>
-              <p className="mt-2 text-lg text-neutral-700">
-                <span className="font-bold">{pendingRevive.playerName}</span> is requesting to be
-                revived!
-              </p>
-              <p className="mt-3 text-sm text-neutral-500">
-                Have them complete the real-world forfeit. Then approve or decline.
-              </p>
-            </div>
-            <div className="mt-8 grid grid-cols-2 gap-3">
+        <div className="game-modal-backdrop">
+          <div className="game-card w-full p-8 text-center" style={{ maxWidth: 420 }}>
+            <div className="text-5xl">🙏</div>
+            <h2
+              className="mt-4 text-xl font-bold text-white"
+              style={{ fontFamily: 'var(--font-display)' }}
+            >
+              Revive Shrine
+            </h2>
+            <p className="mt-2 text-base text-white">
+              <span className="font-bold">{pendingRevive.playerName}</span> wants to be revived!
+            </p>
+            <p className="mt-2 text-sm" style={{ color: 'rgba(255,255,255,0.45)' }}>
+              Have them complete the forfeit, then decide.
+            </p>
+            <div className="mt-6 grid grid-cols-2 gap-3">
               <button
                 type="button"
                 onClick={() => emitHost('revive:approve', {}, 'Approve Revive')}
-                className="rounded-xl bg-emerald-600 px-4 py-3 text-base font-bold text-white hover:bg-emerald-700"
+                className="host-btn host-btn-green"
+                style={{ padding: '14px' }}
               >
                 ✅ Approve
               </button>
               <button
                 type="button"
                 onClick={() => emitHost('revive:decline', {}, 'Decline Revive')}
-                className="rounded-xl bg-red-600 px-4 py-3 text-base font-bold text-white hover:bg-red-700"
+                className="host-btn host-btn-red"
+                style={{ padding: '14px' }}
               >
                 ❌ Decline
               </button>
@@ -337,450 +346,459 @@ export default function HostRoomClient({ code }: { code: string }) {
         </div>
       )}
 
-      <div className="mx-auto max-w-4xl space-y-5">
+      <div className="mx-auto max-w-5xl space-y-4 px-6 pt-5">
         {/* ── Header ── */}
-        <header className="rounded-2xl border p-5">
-          <div className="flex items-end justify-between gap-4">
-            <div>
-              <div className="text-sm text-neutral-500">Host Dashboard</div>
-              <h1 className="text-2xl font-bold">
+        <header className="game-card px-6 py-5">
+          <div className="flex items-center justify-between gap-6">
+            <div className="min-w-0">
+              <div
+                className="text-[10px] font-bold tracking-wider uppercase"
+                style={{ color: 'rgba(255,255,255,0.3)', fontFamily: 'var(--font-display)' }}
+              >
+                Host Dashboard
+              </div>
+              <h1
+                className="mt-1 truncate text-xl font-bold text-white"
+                style={{ fontFamily: 'var(--font-display)' }}
+              >
                 {hostName ? `${hostName}'s Room` : 'Host Room'}
               </h1>
-              <div className="mt-1 text-sm text-neutral-600">
-                Code: <span className="font-mono text-lg font-bold">{roomCode}</span>
+              <div
+                className="mt-1 flex items-center gap-3 text-sm"
+                style={{ color: 'rgba(255,255,255,0.45)' }}
+              >
+                <span>
+                  Code: <span className="font-mono font-bold text-white">{roomCode}</span>
+                </span>
+                {lanUrl && (
+                  <span>
+                    LAN: <span className="font-mono text-[11px]">{lanUrl}</span>
+                  </span>
+                )}
               </div>
-              {lanUrl && (
-                <div className="mt-1 text-sm text-neutral-600">
-                  LAN: <span className="font-mono">{lanUrl}</span>
-                </div>
-              )}
             </div>
-            <div className="text-right">
-              <div className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-semibold">
-                Phase: {phase}
-              </div>
+            <div className="flex shrink-0 items-center gap-3">
+              <PhaseChip phase={phase} />
               {currentAct && (
-                <div className="mt-1 text-xs text-neutral-500">
-                  {currentAct.emoji} {currentAct.name} · Q{currentAct.questionNumber}/
-                  {currentAct.totalQuestions}
+                <span className="text-[11px]" style={{ color: 'rgba(255,255,255,0.4)' }}>
+                  {currentAct.emoji} Q{currentAct.questionNumber}/{currentAct.totalQuestions}
+                </span>
+              )}
+              <span className="text-[11px] tabular-nums" style={{ color: 'rgba(255,255,255,0.3)' }}>
+                {room?.remainingQuestions ?? '?'} left
+              </span>
+            </div>
+          </div>
+          {error && (
+            <p className="mt-3 text-xs font-medium" style={{ color: '#f87171' }}>
+              {error}
+            </p>
+          )}
+        </header>
+
+        {/* ── Two-column layout ── */}
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          {/* LEFT: Game controls + question */}
+          <div className="space-y-4 lg:col-span-2">
+            {/* Act Banner */}
+            {currentAct && (
+              <ActBanner
+                actId={currentAct.id}
+                name={currentAct.name}
+                emoji={currentAct.emoji}
+                description={currentAct.description}
+                heartsAtRisk={currentAct.heartsAtRisk}
+                questionNumber={currentAct.questionNumber}
+                totalQuestions={currentAct.totalQuestions}
+              />
+            )}
+
+            {/* Game Flow Controls */}
+            <div className="game-card p-5">
+              <div
+                className="mb-3 text-[10px] font-bold tracking-wider uppercase"
+                style={{ color: 'rgba(255,255,255,0.3)', fontFamily: 'var(--font-display)' }}
+              >
+                Game Flow
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="host-btn host-btn-green"
+                  disabled={phase !== 'lobby' && phase !== 'shop' && phase !== 'reveal'}
+                  onClick={() => {
+                    if (phase === 'lobby') emitHost('game:start', {}, 'Start Game');
+                    else emitHost('question:next', {}, 'Next Question');
+                  }}
+                  type="button"
+                >
+                  {phase === 'lobby' ? '▶ Start Game' : '⏭ Next Question'}
+                </button>
+                <button
+                  className="host-btn host-btn-amber"
+                  disabled={!canReveal}
+                  onClick={() => emitHost('question:reveal', {}, 'Reveal')}
+                  type="button"
+                >
+                  👁 Reveal
+                </button>
+                <button
+                  className="host-btn host-btn-violet"
+                  disabled={phase !== 'reveal' && phase !== 'shop' && phase !== 'intermission'}
+                  onClick={() =>
+                    emitHost(
+                      'shop:open',
+                      { open: !shopOpen },
+                      shopOpen ? 'Close Shop' : 'Open Shop'
+                    )
+                  }
+                  type="button"
+                >
+                  🛒 {shopOpen ? 'Close Shop' : 'Open Shop'}
+                </button>
+                <button
+                  className="host-btn host-btn-pink"
+                  disabled={!isWager || !wager?.open}
+                  onClick={() => emitHost('wager:lock', {}, 'Lock Wagers')}
+                  type="button"
+                >
+                  🎰 Lock Wagers
+                </button>
+                <button
+                  className="host-btn host-btn-red"
+                  disabled={!availableActs.includes('boss_fight') || !isIntermission}
+                  onClick={() => emitHost('act:start', { actId: 'boss_fight' }, 'Start Boss')}
+                  type="button"
+                >
+                  🐉 Boss
+                </button>
+              </div>
+
+              {/* Act Transitions */}
+              {isIntermission && availableActs.length > 0 && (
+                <div className="game-card-compact mt-4 p-4">
+                  <div className="mb-3 text-xs font-bold text-white">
+                    🎬 {currentAct?.name} complete! Start next:
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {availableActs.map((actId) => {
+                      const meta = ACT_META[actId];
+                      return (
+                        <button
+                          key={actId}
+                          type="button"
+                          onClick={() => emitHost('act:start', { actId }, `Start ${meta.name}`)}
+                          className={`host-btn ${ACT_BTN_CLS[actId] ?? 'host-btn-green'}`}
+                        >
+                          {meta.emoji} {meta.name}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
-              <div className="mt-1 text-xs text-neutral-500">
-                Questions left: {room?.remainingQuestions ?? '?'}
-              </div>
-            </div>
-          </div>
-          {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
-        </header>
-        {/* ── Current Act Banner ── */}
-        {currentAct && (
-          <section
-            className={`rounded-2xl border p-4 ${
-              currentAct.heartsAtRisk ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-bold">
-                  {currentAct.emoji} {currentAct.name}
-                </h2>
-                <p className="text-sm text-neutral-600">{currentAct.description}</p>
-              </div>
-              <div className="text-right text-sm">
-                <div
-                  className={`rounded-full px-3 py-1 text-xs font-bold ${
-                    currentAct.heartsAtRisk
-                      ? 'bg-red-100 text-red-700'
-                      : 'bg-green-100 text-green-700'
-                  }`}
-                >
-                  {currentAct.heartsAtRisk ? '❤️ Hearts at risk' : '🛡️ Hearts safe'}
-                </div>
-                <div className="mt-1 text-xs text-neutral-500">
-                  Progress: {currentAct.questionNumber}/{currentAct.totalQuestions}
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
-        {/* ── Game Flow ── */}
-        <section className="rounded-2xl border p-5">
-          <h2 className="text-lg font-semibold">Game Flow</h2>
-          <p className="mt-1 text-xs text-neutral-500">
-            Start Act → Questions → Reveal → (Shop) → Next Question → … → Intermission → Next Act
-          </p>
-
-          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {/* Start Game / Next Question */}
-            <button
-              className="rounded-xl bg-green-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-green-700 disabled:opacity-40"
-              disabled={phase !== 'lobby' && phase !== 'shop' && phase !== 'reveal'}
-              onClick={() => {
-                if (phase === 'lobby') {
-                  emitHost('game:start', {}, 'Start Game (Act 1)');
-                } else {
-                  emitHost('question:next', {}, 'Next Question');
-                }
-              }}
-              type="button"
-            >
-              {phase === 'lobby' ? '▶ Start Game' : '⏭ Next Question'}
-            </button>
-
-            {/* Reveal */}
-            <button
-              className="rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-amber-600 disabled:opacity-40"
-              disabled={!canReveal}
-              onClick={() => emitHost('question:reveal', {}, 'Reveal Answer')}
-              type="button"
-            >
-              👁 Reveal Answer
-            </button>
-
-            {/* Shop */}
-            <button
-              className="rounded-xl bg-purple-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-purple-700 disabled:opacity-40"
-              disabled={phase !== 'reveal' && phase !== 'shop' && phase !== 'intermission'}
-              onClick={() =>
-                emitHost('shop:open', { open: !shopOpen }, shopOpen ? 'Close Shop' : 'Open Shop')
-              }
-              type="button"
-            >
-              🛒 {shopOpen ? 'Close Shop' : 'Open Shop'}
-            </button>
-
-            {/* Lock Wagers (High Stakes) */}
-            <button
-              className="rounded-xl bg-pink-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-pink-700 disabled:opacity-40"
-              disabled={!isWager || !wager?.open}
-              onClick={() => emitHost('wager:lock', {}, 'Lock Wagers')}
-              type="button"
-            >
-              🎰 Lock Wagers
-            </button>
-
-            {/* Boss (only available as an act transition from intermission) */}
-            <button
-              className="rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-40"
-              disabled={!availableActs.includes('boss_fight') || !isIntermission}
-              onClick={() => emitHost('act:start', { actId: 'boss_fight' }, 'Start Boss Fight')}
-              type="button"
-            >
-              🐉 Start Boss
-            </button>
-          </div>
-
-          {/* ── Act Transitions (during intermission) ── */}
-          {isIntermission && availableActs.length > 0 && (
-            <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-4">
-              <h3 className="text-sm font-bold text-blue-800">
-                🎬 {currentAct?.name} complete! Start next act:
-              </h3>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {availableActs.map((actId) => {
-                  const meta = ACT_META[actId];
-                  return (
-                    <button
-                      key={actId}
-                      type="button"
-                      onClick={() => emitHost('act:start', { actId }, `Start ${meta.name}`)}
-                      className={`rounded-xl px-4 py-2.5 text-sm font-semibold text-white transition-colors ${
-                        actId === 'boss_fight'
-                          ? 'bg-red-600 hover:bg-red-700'
-                          : actId === 'wager_round'
-                            ? 'bg-pink-600 hover:bg-pink-700'
-                            : actId === 'field_trip'
-                              ? 'bg-orange-600 hover:bg-orange-700'
-                              : actId === 'pop_quiz'
-                                ? 'bg-amber-600 hover:bg-amber-700'
-                                : 'bg-green-600 hover:bg-green-700'
-                      }`}
-                    >
-                      {meta.emoji} Start {meta.name}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="mt-2 text-xs text-blue-600">
-                💡 You can also open the Shop first, then start the next act.
-              </p>
-            </div>
-          )}
-        </section>{' '}
-        {/* ── Wager Phase ── */}
-        {isWager && wager && (
-          <section className="rounded-2xl border border-pink-200 bg-pink-50 p-5">
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold text-pink-800">🎰 High Stakes — Redline</h2>
-              <div
-                className={`rounded-xl border bg-white px-3 py-1.5 text-sm font-semibold tabular-nums ${
-                  wagerSiren ? 'animate-pulse border-red-400 bg-red-50 text-red-700' : ''
-                }`}
-              >
-                {wagerSecondsLeft}s
-              </div>
             </div>
 
-            <div className="mt-2 text-xs text-neutral-600">
-              Stage: <span className="font-bold">{String(wagerStage).toUpperCase()}</span>
-              {wagerNoDecreases ? (
-                <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">
-                  🚨 NO DECREASES
-                </span>
-              ) : null}
-              <span className="ml-2 text-pink-700">
-                · Total wagered: <span className="font-bold">{wager.totalWagered}</span>
-              </span>
-            </div>
-
-            <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
-              {[
-                ['blind', '???'],
-                ['category', 'Category'],
-                ['hint', 'Hint'],
-                ['redline', 'REDLINE'],
-                ['closing', 'Closing'],
-              ].map(([id, label]) => {
-                const idx =
-                  id === 'blind'
-                    ? 0
-                    : id === 'category'
-                      ? 1
-                      : id === 'hint'
-                        ? 2
-                        : id === 'redline'
-                          ? 3
-                          : 4;
-                const done = wagerStageIndex >= idx;
-                return (
-                  <span
-                    key={id}
-                    className={`rounded-full border px-2 py-0.5 font-semibold ${
-                      done
-                        ? 'border-pink-500 bg-pink-100 text-pink-800'
-                        : 'border-neutral-200 bg-white text-neutral-500'
-                    }`}
+            {/* Wager Phase */}
+            {isWager && wager && (
+              <div className="game-card p-5" style={{ borderColor: 'rgba(236,72,153,0.15)' }}>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h2
+                    className="text-base font-bold text-white"
+                    style={{ fontFamily: 'var(--font-display)' }}
                   >
-                    {label}
-                  </span>
-                );
-              })}
-            </div>
-
-            <div className="mt-3 rounded-xl border bg-white p-4 text-sm">
-              <div className="font-semibold text-neutral-800">
-                Category: <span className="font-bold">{wager.category ?? '???'}</span>
-              </div>
-              <div className="mt-1 text-sm text-neutral-600">
-                Hint: <span className="font-medium">{wager.hint ?? '???'}</span>
-              </div>
-
-              {!wager.open ? (
-                <div className="mt-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 text-sm font-semibold text-neutral-700">
-                  🔒 Wagers locked — Spotlight in progress…
+                    🎰 High Stakes
+                  </h2>
+                  <TimerRing
+                    seconds={wagerSecondsLeft}
+                    fraction={wagerSecondsLeft / 30}
+                    size={48}
+                    strokeWidth={3}
+                    color="#ec4899"
+                  >
+                    <span
+                      className={`text-xs font-bold text-white tabular-nums ${wagerSiren ? 'siren-active' : ''}`}
+                    >
+                      {wagerSecondsLeft}
+                    </span>
+                  </TimerRing>
                 </div>
-              ) : null}
-            </div>
-          </section>
-        )}
-        {/* ── Current Question ── */}
-        {q && (
-          <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
-            <h2 className="text-lg font-semibold">
-              {phase === 'boss' ? '🐉 Boss Question' : '❓ Current Question'}
-            </h2>
-
-            {/* Hearts at risk indicator */}
-            {q.question.hard && (
-              <span className="mt-1 inline-block rounded-full bg-red-100 px-2 py-0.5 text-xs font-bold text-red-700">
-                ⚠️ HARD — hearts at risk
-              </span>
+                <div className="game-card-compact mb-3 p-4">
+                  <div className="text-sm text-white">
+                    Category:{' '}
+                    <span className="font-bold" style={{ color: '#f472b6' }}>
+                      {wager.category ?? '???'}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-sm" style={{ color: 'rgba(255,255,255,0.5)' }}>
+                    Hint: {wager.hint ?? '???'}
+                  </div>
+                  <div className="mt-2 text-[11px]" style={{ color: 'rgba(255,255,255,0.4)' }}>
+                    Total wagered:{' '}
+                    <span className="font-bold text-white">{wager.totalWagered}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <WagerStages currentIndex={wagerStageIndex} />
+                  {wagerNoDecreases && (
+                    <span
+                      className="rounded-full px-2.5 py-0.5 text-[10px] font-bold"
+                      style={{ background: 'rgba(239,68,68,0.12)', color: '#f87171' }}
+                    >
+                      🚨 NO DECREASES
+                    </span>
+                  )}
+                </div>
+                {!wager.open && (
+                  <div
+                    className="game-card-compact mt-3 p-3 text-center text-sm font-semibold"
+                    style={{ color: 'rgba(255,255,255,0.5)' }}
+                  >
+                    🔒 Locked — Spotlight in progress
+                  </div>
+                )}
+              </div>
             )}
 
-            {/* Timer / Countdown */}
-            {isCountdown ? (
-              <div className="mt-3 flex items-center justify-center gap-3 rounded-xl border bg-blue-50 px-3 py-4">
-                <span className="text-3xl font-black text-blue-600 tabular-nums">
-                  {countdownSecondsLeft}
-                </span>
-                <span className="text-sm font-semibold text-blue-700">Countdown…</span>
-              </div>
-            ) : (
-              <div className="mt-3 flex items-center justify-between rounded-xl border bg-white px-3 py-2 text-sm">
-                <span className="font-semibold">⏱️ Reveal in</span>
-                <span className="font-bold tabular-nums">
-                  {q.locked ? '—' : `${Math.max(0, Math.ceil((revealAt - now) / 1000))}s`}
-                </span>
-              </div>
-            )}
+            {/* Current Question */}
+            {q && (
+              <div className="game-card p-5" style={{ borderColor: 'rgba(245,158,11,0.1)' }}>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h2
+                    className="text-base font-bold text-white"
+                    style={{ fontFamily: 'var(--font-display)' }}
+                  >
+                    {phase === 'boss'
+                      ? '🐉 Boss Question'
+                      : isCountdown
+                        ? '⏳ Countdown'
+                        : '❓ Question'}
+                  </h2>
+                  {q.question.hard && (
+                    <span
+                      className="rounded-full px-2.5 py-0.5 text-[10px] font-bold"
+                      style={{ background: 'rgba(239,68,68,0.12)', color: '#f87171' }}
+                    >
+                      ⚠️ HARD
+                    </span>
+                  )}
+                </div>
 
-            <p className="mt-2 text-xs font-semibold text-neutral-700">
-              🔒 Locked in:{' '}
-              <span className="tabular-nums">
-                {lockedInCount}/{activeCount}
-              </span>
-              {allLockedIn ? ' · All locked!' : ''}
-            </p>
+                {/* Timer */}
+                {isCountdown ? (
+                  <div className="flex items-center justify-center py-4">
+                    <div
+                      className="countdown-number"
+                      key={countdownSecondsLeft}
+                      style={{
+                        fontFamily: 'var(--font-display)',
+                        fontWeight: 900,
+                        fontSize: 60,
+                        color: '#60a5fa',
+                      }}
+                    >
+                      {countdownSecondsLeft || '🚀'}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="game-card-compact mb-3 flex items-center justify-between px-4 py-3">
+                    <div className="text-sm font-semibold text-white">
+                      {q.locked ? 'Revealed' : 'Reveal in'}
+                    </div>
+                    <span className="text-sm font-bold text-white tabular-nums">
+                      {q.locked ? '—' : `${Math.max(0, Math.ceil((revealAt - now) / 1000))}s`}
+                    </span>
+                  </div>
+                )}
 
-            <p className="mt-2 text-sm font-medium">{q.question.prompt}</p>
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              {q.question.choices.map((c, i) => (
                 <div
-                  key={i}
-                  className={`rounded-lg border px-3 py-2 text-sm ${
-                    hostState?.currentAnswerIndex === i
-                      ? 'border-green-500 bg-green-100 font-bold'
-                      : 'border-neutral-200 bg-white'
-                  }`}
+                  className="mb-3 flex items-center gap-3 text-[11px] font-bold"
+                  style={{ color: 'rgba(255,255,255,0.4)' }}
                 >
-                  {String.fromCharCode(65 + i)}: {c}
-                  {hostState?.currentAnswerIndex === i && ' ✅'}
-                </div>
-              ))}
-            </div>
-            <div className="mt-2 text-xs text-neutral-500">
-              {q.question.category} · {q.question.value} pts · {q.locked ? 'Locked' : 'Open'}
-            </div>
-          </section>
-        )}
-        {/* ── Boss HP ── */}
-        {boss && (
-          <section className="rounded-2xl border border-red-200 bg-red-50 p-5">
-            <h2 className="text-lg font-semibold">🐉 Boss Fight</h2>
-            <div className="mt-2 text-sm">
-              HP: <span className="font-bold">{boss.hp}</span> / {boss.maxHp}
-            </div>
-            <div className="mt-1 h-3 w-full overflow-hidden rounded-full bg-red-200">
-              <div
-                className="h-full bg-red-500 transition-all"
-                style={{ width: `${(boss.hp / boss.maxHp) * 100}%` }}
-              />
-            </div>
-          </section>
-        )}
-        {/* ── Final Results ── */}
-        {phase === 'ended' &&
-          (room?.players.length ?? 0) > 0 &&
-          (() => {
-            const sorted = [...(room?.players ?? [])].sort((a, b) => b.score - a.score);
-            const podium = sorted.slice(0, 3);
-            const medals = ['🥇', '🥈', '🥉'];
-
-            return (
-              <section className="rounded-2xl border-2 border-amber-300 bg-linear-to-b from-amber-50 to-white p-6">
-                <h2 className="text-center text-2xl font-bold">🏆 Game Over!</h2>
-
-                <div className="mt-5 flex items-end justify-center gap-3">
-                  {podium.map((p, i) => (
-                    <div
-                      key={p.playerId}
-                      className={`flex flex-col items-center rounded-xl border p-3 ${
-                        i === 0
-                          ? 'order-2 min-w-28 border-amber-300 bg-amber-50'
-                          : i === 1
-                            ? 'order-1 min-w-24 border-neutral-300 bg-neutral-50'
-                            : 'order-3 min-w-24 border-orange-200 bg-orange-50'
-                      }`}
-                    >
-                      <span className="text-2xl">{medals[i]}</span>
-                      <span className="mt-1 text-sm font-bold">{p.name}</span>
-                      <span className="mt-0.5 text-lg font-black tabular-nums">{p.score}</span>
-                      <span className="text-xs text-neutral-500">points</span>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Full rankings */}
-                <div className="mt-4 space-y-1.5">
-                  {sorted.map((p, rank) => (
-                    <div
-                      key={p.playerId}
-                      className="flex items-center justify-between rounded-lg border px-3 py-2 text-sm"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="w-5 font-bold text-neutral-400">{rank + 1}.</span>
-                        <span className="font-medium">{p.name}</span>
-                        {p.eliminated && <span className="text-xs text-red-500">💀</span>}
-                      </div>
-                      <span className="font-bold tabular-nums">{p.score}</span>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            );
-          })()}
-        {/* ── Players ── */}
-        <section className="rounded-2xl border p-5">
-          <h2 className="text-lg font-semibold">Players ({room?.players.length ?? 0})</h2>
-          {(room?.players.length ?? 0) === 0 && (
-            <p className="mt-2 text-sm text-neutral-500">
-              No players yet. Share the code or LAN URL.
-            </p>
-          )}
-          <div className="mt-3 space-y-2">
-            {(room?.players ?? []).map((p) => (
-              <div
-                key={p.playerId}
-                className={`flex items-center justify-between rounded-xl border px-4 py-3 ${
-                  p.eliminated ? 'bg-neutral-50 opacity-60' : ''
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-medium">{p.name}</span>
-                  {p.eliminated && (
-                    <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700">
-                      💀
-                    </span>
-                  )}
-                  {p.buffs?.doublePoints && (
-                    <span
-                      className="rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-800"
-                      title="Double Points armed"
-                    >
-                      ⭐ 2×
-                    </span>
-                  )}
-                  {p.buffs?.shield && (
-                    <span
-                      className="rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-800"
-                      title="Shield armed"
-                    >
-                      🛡️
-                    </span>
-                  )}
-                  {(p.inventory['buyback_token'] ?? 0) > 0 && (
-                    <span
-                      className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-800"
-                      title="Has buyback token"
-                    >
-                      🪙
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-4 text-xs text-neutral-600">
-                  <span>❤️ {p.lives}</span>
-                  <span>⭐ {p.score}</span>
-                  <span>🪙 {p.coins}</span>
-                  <span className={p.connected ? 'text-green-600' : 'text-red-500'}>
-                    {p.connected ? '●' : '○'}
+                  <span>
+                    🔒 {lockedInCount}/{activeCount} locked
                   </span>
+                  {allLockedIn && <span style={{ color: '#4ade80' }}>All locked!</span>}
+                </div>
+
+                <p className="text-base font-semibold text-white">{q.question.prompt}</p>
+
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  {q.question.choices.map((c, i) => {
+                    const isAnswer = hostState?.currentAnswerIndex === i;
+                    return (
+                      <div
+                        key={i}
+                        className={`answer-card ${isAnswer ? 'answer-correct' : ''}`}
+                        style={{ cursor: 'default' }}
+                      >
+                        <div className="flex items-center">
+                          <span className="answer-letter">{String.fromCharCode(65 + i)}</span>
+                          <span className="flex-1">{c}</span>
+                          {isAnswer && <span className="ml-2">✓</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 text-[11px]" style={{ color: 'rgba(255,255,255,0.3)' }}>
+                  {q.question.category} · {q.question.value} pts · {q.locked ? 'Locked' : 'Open'}
                 </div>
               </div>
-            ))}
+            )}
+
+            {/* Boss HP */}
+            {boss && <BossBar hp={boss.hp} maxHp={boss.maxHp} />}
+
+            {/* Final Results */}
+            {phase === 'ended' &&
+              (room?.players.length ?? 0) > 0 &&
+              (() => {
+                const sorted = [...(room?.players ?? [])].sort((a, b) => b.score - a.score);
+                const podium = sorted.slice(0, 3);
+                const medals = ['🥇', '🥈', '🥉'];
+                return (
+                  <div className="game-card p-6">
+                    <h2
+                      className="mb-6 text-center text-2xl font-bold text-white"
+                      style={{ fontFamily: 'var(--font-display)' }}
+                    >
+                      🏆 Game Over!
+                    </h2>
+                    <div className="flex items-end justify-center gap-4">
+                      {podium.map((p, i) => {
+                        const heights = [160, 130, 110];
+                        const gradients = [
+                          'linear-gradient(135deg, rgba(245,158,11,0.15), rgba(245,158,11,0.05))',
+                          'linear-gradient(135deg, rgba(148,163,184,0.1), rgba(148,163,184,0.03))',
+                          'linear-gradient(135deg, rgba(234,88,12,0.1), rgba(234,88,12,0.03))',
+                        ];
+                        const borders = [
+                          'rgba(245,158,11,0.3)',
+                          'rgba(148,163,184,0.2)',
+                          'rgba(234,88,12,0.2)',
+                        ];
+                        const order = [2, 1, 3];
+                        return (
+                          <div
+                            key={p.playerId}
+                            className={`podium-${i === 0 ? '1st' : i === 1 ? '2nd' : '3rd'} flex flex-col items-center rounded-2xl p-4`}
+                            style={{
+                              order: order[i],
+                              minWidth: i === 0 ? 120 : 100,
+                              height: heights[i],
+                              background: gradients[i],
+                              border: `1px solid ${borders[i]}`,
+                              justifyContent: 'center',
+                            }}
+                          >
+                            <span className="text-3xl">{medals[i]}</span>
+                            <span className="mt-1 text-sm font-bold text-white">{p.name}</span>
+                            <span
+                              className="text-xl font-black tabular-nums"
+                              style={{ fontFamily: 'var(--font-display)', color: '#fbbf24' }}
+                            >
+                              {p.score}
+                            </span>
+                            <span
+                              className="text-[10px]"
+                              style={{ color: 'rgba(255,255,255,0.4)' }}
+                            >
+                              points
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {/* Full rankings */}
+                    <div className="mt-5 space-y-1.5">
+                      {sorted.map((p, rank) => (
+                        <PlayerRow
+                          key={p.playerId}
+                          name={`${rank + 1}. ${p.name}`}
+                          lives={p.lives}
+                          score={p.score}
+                          coins={p.coins}
+                          connected={p.connected}
+                          eliminated={p.eliminated}
+                          buffs={p.buffs}
+                          hasBuyback={(p.inventory['buyback_token'] ?? 0) > 0}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
           </div>
-        </section>
-        {/* ── Event Log ── */}
-        <section className="rounded-2xl border p-5">
-          <h2 className="text-lg font-semibold">Event Log</h2>
-          <div className="mt-2 max-h-48 overflow-y-auto rounded-lg bg-neutral-50 p-3 font-mono text-xs">
-            {log.length === 0 && <p className="text-neutral-400">No events yet…</p>}
-            {log.map((entry, i) => (
-              <div key={i} className="py-0.5">
-                {entry}
+
+          {/* RIGHT: Players + Log */}
+          <div className="space-y-4">
+            {/* Players */}
+            <div className="game-card p-5">
+              <div
+                className="mb-3 text-[10px] font-bold tracking-wider uppercase"
+                style={{ color: 'rgba(255,255,255,0.3)', fontFamily: 'var(--font-display)' }}
+              >
+                Players ({room?.players.length ?? 0})
               </div>
-            ))}
+              {(room?.players.length ?? 0) === 0 && (
+                <p className="text-sm" style={{ color: 'rgba(255,255,255,0.35)' }}>
+                  No players yet. Share the code or LAN URL.
+                </p>
+              )}
+              <div className="space-y-1.5">
+                {(room?.players ?? []).map((p) => (
+                  <PlayerRow
+                    key={p.playerId}
+                    name={p.name}
+                    lives={p.lives}
+                    score={p.score}
+                    coins={p.coins}
+                    connected={p.connected}
+                    eliminated={p.eliminated}
+                    lockedIn={p.lockedIn}
+                    buffs={p.buffs}
+                    hasBuyback={(p.inventory['buyback_token'] ?? 0) > 0}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Event Log */}
+            <div className="game-card p-5">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between"
+                onClick={() => setShowLog((v) => !v)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'white' }}
+              >
+                <span
+                  className="text-[10px] font-bold tracking-wider uppercase"
+                  style={{ color: 'rgba(255,255,255,0.3)', fontFamily: 'var(--font-display)' }}
+                >
+                  Event Log
+                </span>
+                <span className="text-[11px]" style={{ color: 'rgba(255,255,255,0.3)' }}>
+                  {showLog ? '▼' : '▶'}
+                </span>
+              </button>
+              {showLog && (
+                <div
+                  className="mt-3 max-h-48 overflow-y-auto rounded-xl p-3 font-mono text-[11px]"
+                  style={{ background: 'rgba(0,0,0,0.3)', color: 'rgba(255,255,255,0.45)' }}
+                >
+                  {log.length === 0 && (
+                    <p style={{ color: 'rgba(255,255,255,0.2)' }}>No events yet…</p>
+                  )}
+                  {log.map((entry, i) => (
+                    <div key={i} className="py-0.5">
+                      {entry}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-        </section>
+        </div>
       </div>
     </main>
   );
