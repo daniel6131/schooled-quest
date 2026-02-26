@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "express": "^5.2.1",
+    "lucide-react": "^0.575.0",
     "nanoid": "^5.1.6",
     "next": "16.1.6",
     "pino": "^10.3.1",
