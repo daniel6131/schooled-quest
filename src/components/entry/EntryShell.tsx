@@ -1,18 +1,28 @@
 import EntryBackground from '@/components/visual/EntryBackground';
 import type { ReactNode } from 'react';
 
-export function EntryShell({ children }: { children: ReactNode }) {
+export function EntryShell({ children, footer }: { children: ReactNode; footer?: ReactNode }) {
   return (
-    <main className="relative min-h-svh">
+    <main className="relative" style={{ minHeight: 'calc(var(--sq-vh) * 100)' }}>
       <EntryBackground />
+
       <div
-        className="relative z-10 mx-auto flex min-h-svh w-full max-w-lg items-center justify-center px-5 sm:px-6"
+        className="relative z-10 mx-auto flex w-full max-w-140 flex-col justify-center px-5 sm:px-6"
         style={{
-          paddingTop: 'max(32px, env(safe-area-inset-top))',
-          paddingBottom: 'max(32px, env(safe-area-inset-bottom))',
+          minHeight: 'calc(var(--sq-vh) * 100)',
+          paddingTop: 'max(24px, env(safe-area-inset-top))',
+          paddingBottom: 'max(24px, env(safe-area-inset-bottom))',
         }}
       >
         {children}
+
+        {footer ? (
+          <div className="mt-6 text-center">{footer}</div>
+        ) : (
+          <div className="mt-6 text-center text-[11px] text-white/35">
+            Tip: best experience on the same Wi-Fi.
+          </div>
+        )}
       </div>
     </main>
   );

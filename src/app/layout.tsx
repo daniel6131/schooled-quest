@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import './globals.css';
+import ViewportVars from './ViewpointVars';
 
 export const metadata: Metadata = {
   title: 'Schooled Quest',
@@ -17,6 +18,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body suppressHydrationWarning>
+        <ViewportVars />
         <div className="sq-app">{children}</div>
       </body>
     </html>

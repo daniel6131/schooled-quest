@@ -2,110 +2,126 @@
 
 import { EntryShell } from '@/components/entry/EntryShell';
 import {
+  CTAButton,
+  GhostButton,
   GlowCard,
-  GlowInput,
   GradientTitle,
-  ShimmerButton,
+  HintText,
+  InputLabel,
+  NeonInput,
   SubtleLead,
 } from '@/components/entry/primitives';
-import { ArrowLeft } from 'lucide-react';
+import { cleanRoomCode, setLocalStorageString, useLocalStorageString } from '@/lib/persist';
+import { ArrowLeft, ArrowRight, KeyRound, User } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useMemo, useState, useSyncExternalStore } from 'react';
+import { useMemo, useState } from 'react';
 
 const LS_NAME = 'sq_name_last';
-const LOCAL_STORAGE_EVENT = 'sq:localstorage';
-
-function cleanCode(raw: string) {
-  return raw
-    .replace(/[^a-z0-9]/gi, '')
-    .toUpperCase()
-    .slice(0, 5);
-}
-
-// function setLocalStorageString(key: string, value: string) {
-//   localStorage.setItem(key, value);
-//   window.dispatchEvent(new Event(LOCAL_STORAGE_EVENT));
-// }
-
-function useLocalStorageString(key: string, fallback = '') {
-  return useSyncExternalStore(
-    (onStoreChange) => {
-      if (typeof window === 'undefined') return () => {};
-      window.addEventListener('storage', onStoreChange);
-      window.addEventListener(LOCAL_STORAGE_EVENT, onStoreChange);
-      return () => {
-        window.removeEventListener('storage', onStoreChange);
-        window.removeEventListener(LOCAL_STORAGE_EVENT, onStoreChange);
-      };
-    },
-    () => (typeof window === 'undefined' ? fallback : (localStorage.getItem(key) ?? fallback)),
-    () => fallback
-  );
-}
 
 export default function JoinClient() {
   const router = useRouter();
   const params = useSearchParams();
+
   const savedName = useLocalStorageString(LS_NAME, '');
+  const queryName = (params.get('name') || '').trim();
 
-  // Prefer query param, fallback to saved name
-  const name = (params.get('name') || savedName).trim();
+  const [nameDraft, setNameDraft] = useState(queryName || savedName);
+  const [codeRaw, setCodeRaw] = useState('');
 
-  const [code, setCode] = useState('');
-  const normalizedCode = useMemo(() => cleanCode(code), [code]);
-  const codeOk = normalizedCode.length >= 4;
+  const name = useMemo(() => nameDraft.trim(), [nameDraft]);
+  const code = useMemo(() => cleanRoomCode(codeRaw), [codeRaw]);
+
+  const nameOk = name.length >= 2 && name.length <= 18;
+  const codeOk = code.length >= 4;
 
   function join() {
-    if (!name || !codeOk) return;
-    router.push(`/play/${normalizedCode}?name=${encodeURIComponent(name)}`);
+    if (!nameOk || !codeOk) return;
+    setLocalStorageString(LS_NAME, name.slice(0, 18));
+    router.push(`/play/${code}?name=${encodeURIComponent(name)}`);
   }
 
   return (
     <EntryShell>
-      <GlowCard>
-        <GradientTitle>Join a room</GradientTitle>
-        <SubtleLead>Enter the room code and you’ll land in the lobby.</SubtleLead>
+      <div className="w-full">
+        <GlowCard>
+          <div className="flex flex-col gap-6">
+            <div className="text-center">
+              <GradientTitle>Join a lobby</GradientTitle>
+              <SubtleLead>Enter the room code and you’ll land in the lobby instantly.</SubtleLead>
+            </div>
 
-        <div className="mt-6 space-y-2">
-          <label className="text-xs font-semibold tracking-wide text-white/70">ROOM CODE</label>
-          <GlowInput
-            value={normalizedCode}
-            onChange={(e) => setCode(cleanCode(e.target.value))}
-            placeholder="ABCDE"
-            className="tracking-[0.35em] uppercase"
-            inputMode="text"
-            autoComplete="one-time-code"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') join();
-            }}
-          />
-          <div className="flex items-center justify-between text-[11px] text-white/45">
-            <span>{codeOk ? 'Ready.' : 'Enter at least 4 characters.'}</span>
-            <span className="tabular-nums">{normalizedCode.length}/5</span>
+            {/* Name */}
+            <div>
+              <InputLabel>
+                <span className="inline-flex items-center gap-2">
+                  <User size={14} className="text-white/55" />
+                  Your name
+                </span>
+              </InputLabel>
+              <NeonInput
+                value={nameDraft}
+                onChange={(e) => {
+                  const v = e.target.value.slice(0, 18);
+                  setNameDraft(v);
+                  setLocalStorageString(LS_NAME, v);
+                }}
+                placeholder="e.g. NeonNinja"
+                autoComplete="nickname"
+                inputMode="text"
+              />
+              <HintText className="mt-2">{nameOk ? '✓ Ready' : '2–18 characters'}</HintText>
+            </div>
+
+            {/* Code */}
+            <div>
+              <InputLabel>
+                <span className="inline-flex items-center gap-2">
+                  <KeyRound size={14} className="text-white/55" />
+                  Room code
+                </span>
+              </InputLabel>
+              <NeonInput
+                value={code}
+                onChange={(e) => setCodeRaw(e.target.value)}
+                placeholder="ABCDE"
+                className="text-center tracking-[0.35em] uppercase"
+                style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: '16px',
+                  fontWeight: 700,
+                }}
+                inputMode="text"
+                autoComplete="one-time-code"
+                maxLength={5}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') join();
+                }}
+              />
+              <div className="mt-2 flex items-center justify-between">
+                <HintText>{codeOk ? '✓ Code looks valid' : 'At least 4 characters'}</HintText>
+                <HintText>
+                  <span className="tabular-nums">{code.length}/5</span>
+                </HintText>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="grid gap-3">
+              <CTAButton disabled={!nameOk || !codeOk} onClick={join}>
+                <span className="inline-flex items-center gap-2">
+                  Enter lobby
+                  <ArrowRight size={18} />
+                </span>
+              </CTAButton>
+
+              <GhostButton onClick={() => router.push('/')}>
+                <ArrowLeft size={16} className="text-white/70" />
+                Back
+              </GhostButton>
+            </div>
           </div>
-
-          {!name && (
-            <p className="mt-2 text-xs text-rose-300/90">
-              Missing name. Go back and enter a display name.
-            </p>
-          )}
-        </div>
-
-        <div className="mt-6 grid gap-3">
-          <ShimmerButton disabled={!name || !codeOk} onClick={join}>
-            Join →
-          </ShimmerButton>
-
-          <button
-            type="button"
-            className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/4 px-4 py-3 text-sm text-white/80 transition hover:bg-white/6"
-            onClick={() => router.push('/')}
-          >
-            <ArrowLeft size={16} className="text-white/70" />
-            Back
-          </button>
-        </div>
-      </GlowCard>
+        </GlowCard>
+      </div>
     </EntryShell>
   );
 }
